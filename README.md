@@ -114,3 +114,21 @@ ligne), ces modes affichent un avertissement et conservent le contenu intégral.
 
 Prérequis : un Python disposant des modules standard `venv` et `ensurepip` (présents
 dans toute install standard ; sur Debian/Ubuntu minimal : `apt install python3-venv`).
+
+## Architecture du code
+
+```
+codetoia.py            # cœur : CLI, collecte git, transform, sortie XML, setup/venv
+codetoia_langs/        # tout ce qui est spécifique à un langage (un module par langage)
+    base.py            # descripteur Lang, helpers tree-sitter, chargement parsers
+    go.py csharp.py c.py cpp.py javascript.py typescript.py robot.py
+    __init__.py        # registre : agrège les Lang et expose l'API au cœur
+```
+
+Pour **ajouter un langage**, créer `codetoia_langs/xx.py` qui définit un `Lang`
+(extensions, grammaire tree-sitter, `body_containers` pour les signatures,
+éventuellement `extract_calls` pour le callgraph, marqueurs de commentaires), puis
+l'ajouter à la liste `LANGS` du `__init__`. Le cœur ne change pas.
+
+À déployer : copier `codetoia.py` **et** le dossier `codetoia_langs/` (le `.venv`
+créé par `--setup` reste, lui, propre à chaque machine).

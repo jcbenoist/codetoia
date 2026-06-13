@@ -5,24 +5,28 @@ Objectif : sortie la plus compacte possible (économie de tokens) tout en restan
 intégrale et bien structurée pour un LLM (ChatGPT en priorité). La sélection des
 fichiers est déléguée à `git ls-files`, donc le .gitignore est respecté exactement.
 
+Tout ce qui est spécifique à un langage (grammaire, signatures, graphe d'appel,
+commentaires) vit dans le package `codetoia_langs/` (un module par langage).
+
 Usage :
     python codetoia.py .              # tout le dépôt → presse-papier (+ résumé tokens)
     python codetoia.py . -o dump.xml  # → fichier
     python codetoia.py . --compress   # retire commentaires + lignes vides (gain max)
     python codetoia.py . --signatures   # Go/CS/C/C++/JS/TS/RF : signatures seules
-    python codetoia.py . --architecture # = --signatures + --callgraph (Go)
+    python codetoia.py . --architecture # = --signatures + --callgraph
     python codetoia.py --setup        # installe (1 fois) les libs tree-sitter/tiktoken
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
-import importlib
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+import codetoia_langs as langs
 
 # Fichiers de bruit (lock files, métadonnées) : exclus même si suivis par git.
 DEFAULT_IGNORE_FILES = {
@@ -41,22 +45,6 @@ BINARY_EXTS = {
     ".wasm", ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".lock", ".map", ".min.js", ".min.css",
-}
-
-# Marqueurs de commentaires par extension (pour --strip-comments / --compress).
-LINE_COMMENT = {
-    ".py": "#", ".rb": "#", ".sh": "#", ".bash": "#", ".zsh": "#", ".yaml": "#",
-    ".yml": "#", ".toml": "#", ".pl": "#", ".r": "#", ".jl": "#",
-    ".js": "//", ".ts": "//", ".jsx": "//", ".tsx": "//", ".c": "//", ".h": "//",
-    ".cpp": "//", ".hpp": "//", ".cc": "//", ".java": "//", ".go": "//",
-    ".rs": "//", ".swift": "//", ".kt": "//", ".cs": "//", ".php": "//",
-    ".scala": "//", ".dart": "//",
-}
-BLOCK_COMMENT = {
-    ext: ("/*", "*/")
-    for ext in (".js", ".ts", ".jsx", ".tsx", ".c", ".h", ".cpp", ".hpp", ".cc",
-                ".java", ".go", ".rs", ".swift", ".kt", ".cs", ".php", ".scala",
-                ".css", ".scss", ".less", ".dart")
 }
 
 
@@ -134,22 +122,20 @@ def strip_comments(text: str, ext: str) -> str:
     """Retire commentaires ligne + bloc (best-effort, ne parse pas les chaînes).
 
     Conservateur : ignore une ligne contenant un guillemet pour ne pas couper
-    un '#'/'/'/' situé à l'intérieur d'une chaîne.
+    un marqueur situé à l'intérieur d'une chaîne. Les marqueurs viennent du registre.
     """
-    block = BLOCK_COMMENT.get(ext)
+    line, block = langs.comment_markers(ext)
     if block:
         opener, closer = re.escape(block[0]), re.escape(block[1])
         text = re.sub(opener + r".*?" + closer, "", text, flags=re.DOTALL)
-
-    tok = LINE_COMMENT.get(ext)
-    if tok:
+    if line:
         out = []
-        for line in text.splitlines():
-            if line.lstrip().startswith(tok):
+        for ln in text.splitlines():
+            if ln.lstrip().startswith(line):
                 continue
-            if tok in line and not any(q in line for q in "\"'`"):
-                line = line[: line.index(tok)].rstrip()
-            out.append(line)
+            if line in ln and not any(q in ln for q in "\"'`"):
+                ln = ln[: ln.index(line)].rstrip()
+            out.append(ln)
         text = "\n".join(out)
     return text
 
@@ -172,369 +158,6 @@ def transform(text: str, ext: str, opts: argparse.Namespace) -> str:
                 blank = True
         lines = out
     return "\n".join(lines).strip("\n")
-
-
-# --------------------------------------------------------------------------- #
-# Mode signatures (Tree-sitter) : ne garder que les signatures
-# --------------------------------------------------------------------------- #
-
-EXT_LANG = {
-    ".go": "go",
-    ".cs": "c_sharp",
-    ".c": "c", ".h": "c",
-    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".c++": "cpp",
-    ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
-    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-    ".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
-    ".tsx": "tsx",
-    ".robot": "robot", ".resource": "robot",
-}
-
-# lang → (module pip importable, fonction renvoyant la grammaire). tree-sitter-typescript
-# expose deux grammaires (language_typescript / language_tsx) au lieu de language().
-_LANG_GRAMMARS = {
-    "go": ("tree_sitter_go", "language"),
-    "c_sharp": ("tree_sitter_c_sharp", "language"),
-    "c": ("tree_sitter_c", "language"),
-    "cpp": ("tree_sitter_cpp", "language"),
-    "javascript": ("tree_sitter_javascript", "language"),
-    "typescript": ("tree_sitter_typescript", "language_typescript"),
-    "tsx": ("tree_sitter_typescript", "language_tsx"),
-    "robot": ("tree_sitter_robot", "language"),
-}
-
-# Nœuds-fonctions dont on remplace le corps par { ... } ; tout le reste est conservé
-# (signatures, types/structs/interfaces, imports, commentaires). Seuls les corps de
-# type « bloc » (_BLOCK_BODY_TYPES) sont repliés ; un corps-expression (arrow JS court)
-# est laissé tel quel. Robot Framework est traité à part (pas d'accolades).
-_JS_CONTAINERS = {
-    "function_declaration", "function_expression", "arrow_function",
-    "method_definition", "generator_function", "generator_function_declaration",
-}
-_BODY_CONTAINERS = {
-    "go": {"function_declaration", "method_declaration", "func_literal"},
-    "c_sharp": {
-        "method_declaration", "constructor_declaration", "destructor_declaration",
-        "operator_declaration", "conversion_operator_declaration",
-        "local_function_statement", "accessor_declaration",
-    },
-    "c": {"function_definition"},
-    "cpp": {"function_definition"},
-    "javascript": _JS_CONTAINERS,
-    "typescript": _JS_CONTAINERS,
-    "tsx": _JS_CONTAINERS,
-}
-
-# Corps repliables en { ... } selon la grammaire.
-_BLOCK_BODY_TYPES = {"block", "statement_block", "compound_statement"}
-
-_parsers: dict[str, object | None] = {}  # cache (None = grammaire indisponible)
-_missing_langs: set[str] = set()
-
-
-def _load_parser(lang: str):
-    """Construit un parser Tree-sitter, robuste aux versions d'API. None si KO."""
-    module_name, func_name = _LANG_GRAMMARS[lang]
-    try:
-        import tree_sitter
-        module = importlib.import_module(module_name)
-    except Exception:
-        return None
-    try:
-        capsule = getattr(module, func_name)()
-        try:
-            language = tree_sitter.Language(capsule)        # tree_sitter >= 0.22
-        except TypeError:
-            language = tree_sitter.Language(capsule, lang)   # tree_sitter 0.21
-        try:
-            return tree_sitter.Parser(language)              # API récente
-        except TypeError:
-            parser = tree_sitter.Parser()                    # API ancienne
-            try:
-                parser.language = language
-            except (AttributeError, TypeError):
-                parser.set_language(language)
-            return parser
-    except Exception:
-        return None
-
-
-def _get_parser(lang: str):
-    if lang not in _parsers:
-        _parsers[lang] = _load_parser(lang)
-        if _parsers[lang] is None:
-            _missing_langs.add(lang)
-    return _parsers[lang]
-
-
-def _body_node(node):
-    body = node.child_by_field_name("body")
-    if body is not None:
-        return body
-    for child in node.children:  # repli : bloc, flèche C#
-        if child.type in _BLOCK_BODY_TYPES or child.type == "arrow_expression_clause":
-            return child
-    return None
-
-
-def _collect_robot_bodies(node, edits: list) -> None:
-    """Robot Framework : garde le nom + les [Settings], remplace les étapes par `...`."""
-    if node.type in ("keyword_definition", "test_case_definition"):
-        body = next((c for c in node.children if c.type == "body"), None)
-        if body is not None:
-            steps = [c for c in body.children if c.type == "statement"]
-            if steps:
-                edits.append((steps[0].start_byte, steps[-1].end_byte, b"..."))
-        return
-    for child in node.children:
-        _collect_robot_bodies(child, edits)
-
-
-def _collect_bodies(node, lang: str, edits: list) -> None:
-    if lang == "robot":
-        _collect_robot_bodies(node, edits)
-        return
-    if node.type in _BODY_CONTAINERS[lang]:
-        body = _body_node(node)
-        if body is not None and body.end_byte > body.start_byte:
-            if body.type == "arrow_expression_clause":          # C# `=> expr`
-                edits.append((body.start_byte, body.end_byte, b"=> ..."))
-                return
-            if body.type in _BLOCK_BODY_TYPES:                  # corps à accolades
-                edits.append((body.start_byte, body.end_byte, b"{ ... }"))
-                return
-            # corps-expression (arrow JS court `=> x*x`) : on garde, on descend quand même
-    for child in node.children:
-        _collect_bodies(child, lang, edits)
-
-
-def to_signatures(source: str, lang: str) -> str | None:
-    """Garde signatures + types, remplace les corps de fonctions par `{ ... }`.
-
-    None si Tree-sitter ou la grammaire est indisponible (→ repli appelant).
-    """
-    parser = _get_parser(lang)
-    if parser is None:
-        return None
-    data = source.encode("utf-8")
-    edits: list[tuple[int, int, bytes]] = []
-    _collect_bodies(parser.parse(data).root_node, lang, edits)
-    if not edits:
-        return source
-    edits.sort()
-    out, pos = bytearray(), 0
-    for start, end, rep in edits:
-        out += data[pos:start] + rep
-        pos = end
-    out += data[pos:]
-    return out.decode("utf-8", "replace")
-
-
-# --------------------------------------------------------------------------- #
-# Arbre d'appel intra-projet (prototype : Go)
-# --------------------------------------------------------------------------- #
-
-def _txt(node, data: bytes) -> str:
-    return data[node.start_byte:node.end_byte].decode("utf-8", "replace")
-
-
-def _descend(node, types: set[str]):
-    """Itère récursivement les nœuds des types donnés."""
-    if node.type in types:
-        yield node
-    for child in node.children:
-        yield from _descend(child, types)
-
-
-def _go_func_label(node, data: bytes) -> tuple[str, str]:
-    """(label affiché, nom simple) pour une fonction/méthode Go."""
-    name = node.child_by_field_name("name")
-    simple = _txt(name, data) if name else "?"
-    recv = node.child_by_field_name("receiver")  # méthode : (e *Engine)
-    if recv is not None:
-        tid = next(_descend(recv, {"type_identifier"}), None)
-        if tid is not None:
-            return f"{_txt(tid, data)}.{simple}", simple
-    return simple, simple
-
-
-def _go_callees(body, data: bytes):
-    """Noms (simples) des fonctions appelées dans un corps Go."""
-    for call in _descend(body, {"call_expression"}):
-        fn = call.child_by_field_name("function")
-        if fn is None:
-            continue
-        if fn.type == "identifier":            # foo(...)
-            yield _txt(fn, data)
-        elif fn.type == "selector_expression":  # e.Close(...), pkg.Query(...)
-            field = fn.child_by_field_name("field")
-            if field is not None:
-                yield _txt(field, data)
-
-
-# Une entrée = (label affiché, clé d'appariement | None, [clés des appelés]).
-# clé None = nœud appelant uniquement (ex. test case Robot, non appelable).
-_Func = tuple[str, "str | None", list[str]]
-
-
-def _field_name(node, data: bytes, fallback: set[str]) -> str:
-    n = node.child_by_field_name("name")
-    if n is not None:
-        return _txt(n, data)
-    for c in node.children:
-        if c.type in fallback:
-            return _txt(c, data)
-    return "?"
-
-
-def _extract_go(tree, data: bytes, qual: str) -> list[_Func]:
-    out: list[_Func] = []
-    for node in _descend(tree, {"function_declaration", "method_declaration"}):
-        rest, simple = _go_func_label(node, data)
-        body = node.child_by_field_name("body")
-        callees = list(_go_callees(body, data)) if body is not None else []
-        out.append((f"{qual}.{rest}", simple, callees))
-    return out
-
-
-def _cs_callees(body, data: bytes):
-    for call in _descend(body, {"invocation_expression"}):
-        fn = call.child_by_field_name("function")
-        if fn is None:
-            continue
-        if fn.type == "identifier":               # Foo(...)
-            yield _txt(fn, data)
-        elif fn.type == "member_access_expression":  # x.Foo(...), C.Foo(...)
-            name = fn.child_by_field_name("name")
-            if name is not None:
-                yield _txt(name, data)
-
-
-def _extract_cs(tree, data: bytes) -> list[_Func]:
-    out: list[_Func] = []
-    types = {"class_declaration", "struct_declaration", "interface_declaration",
-             "record_declaration"}
-    funcs = {"method_declaration", "constructor_declaration", "local_function_statement"}
-
-    def walk(node, cls):
-        if node.type in types:
-            cls = _field_name(node, data, {"identifier"})
-            for c in node.children:
-                walk(c, cls)
-            return
-        if node.type in funcs:
-            simple = _field_name(node, data, {"identifier"})
-            label = f"{cls}.{simple}" if cls else simple
-            body = _body_node(node)
-            callees = list(_cs_callees(body, data)) if body is not None else []
-            out.append((label, simple, callees))
-            return
-        for c in node.children:
-            walk(c, cls)
-
-    walk(tree, None)
-    return out
-
-
-def _rf_norm(name: str) -> str:
-    """Robot apparie les keywords insensibles à la casse/espaces/underscores."""
-    return name.lower().replace(" ", "").replace("_", "")
-
-
-def _rf_calls(body, data: bytes):
-    for kw in _descend(body, {"keyword"}):                 # invocation directe
-        yield _rf_norm(_txt(kw, data))
-    for va in _descend(body, {"variable_assignment"}):     # ${x}=  Mon KW  args
-        args = next((c for c in va.children if c.type == "arguments"), None)
-        if args is not None:
-            first = next(iter(args.named_children), None)   # 1er argument = le keyword
-            if first is not None:
-                yield _rf_norm(_txt(first, data))
-
-
-def _extract_rf(tree, data: bytes, qual: str) -> list[_Func]:
-    out: list[_Func] = []
-    for node in _descend(tree, {"keyword_definition", "test_case_definition"}):
-        name = _field_name(node, data, {"name"})
-        body = next((c for c in node.children if c.type == "body"), None)
-        callees = list(_rf_calls(body, data)) if body is not None else []
-        # un test case appelle des keywords mais n'est pas appelable lui-même (clé None)
-        key = _rf_norm(name) if node.type == "keyword_definition" else None
-        out.append((f"{qual}.{name}", key, callees))
-    return out
-
-
-# Langages supportés par le callgraph, et l'extracteur associé.
-_CALLGRAPH_LANGS = ("go", "c_sharp", "robot")
-
-
-def _callgraph_for(lang: str, files: list[Path], root: Path, parser) -> str | None:
-    funcs: list[_Func] = []
-    name_to_labels: dict[str, set[str]] = {}
-    for p in files:
-        try:
-            data = p.read_text(encoding="utf-8", errors="replace").encode("utf-8")
-        except OSError:
-            continue
-        tree = parser.parse(data).root_node
-        if lang == "go":
-            items = _extract_go(tree, data, p.parent.name or root.resolve().name)
-        elif lang == "c_sharp":
-            items = _extract_cs(tree, data)
-        else:  # robot
-            items = _extract_rf(tree, data, p.stem)
-        for label, key, callees in items:
-            funcs.append((label, key, callees))
-            if key is not None:
-                name_to_labels.setdefault(key, set()).add(label)
-
-    declared = set(name_to_labels)
-    forward: list[tuple[str, list[str]]] = []
-    reverse: dict[str, list[str]] = {}
-    for label, key, callees in funcs:
-        resolved: list[str] = []
-        seen: set[str] = set()
-        for c in callees:
-            if c in declared and c not in seen and c != key:
-                seen.add(c)
-                labels = name_to_labels[c]
-                resolved.append(next(iter(labels)) if len(labels) == 1 else c)
-        if resolved:
-            forward.append((label, resolved))
-            for r in resolved:
-                callers = reverse.setdefault(r, [])
-                if label not in callers:
-                    callers.append(label)
-
-    if not forward:
-        return None
-    lines = ["# appelant -> appelés"]
-    lines += [f"{label} -> {', '.join(cs)}" for label, cs in forward]
-    lines.append("# appelés <- appelants (analyse d'impact)")
-    lines += [f"{callee} <- {', '.join(reverse[callee])}" for callee in sorted(reverse)]
-    return "\n".join(lines)
-
-
-def build_callgraph(files: list[Path], root: Path) -> list[tuple[str, str]] | None:
-    """Graphes d'appel intra-projet (Go, C#, Robot) : sens direct + index inversé.
-
-    Renvoie une liste (langage, texte) — une section par langage présent — ou None.
-    Heuristique syntaxique : appelés appariés par nom simple (normalisé en Robot) ;
-    labels qualifiés par dossier (Go), classe (C#) ou fichier (Robot). Un appelé dont
-    le nom reste ambigu (plusieurs déclarations) est laissé en nom simple.
-    """
-    sections: list[tuple[str, str]] = []
-    for lang in _CALLGRAPH_LANGS:
-        lang_files = [p for p in files if EXT_LANG.get(p.suffix.lower()) == lang]
-        if not lang_files:
-            continue
-        parser = _get_parser(lang)
-        if parser is None:
-            continue
-        graph = _callgraph_for(lang, lang_files, root, parser)
-        if graph:
-            sections.append((lang, graph))
-    return sections or None
 
 
 # --------------------------------------------------------------------------- #
@@ -561,6 +184,19 @@ def render_tree(root: Path, files: list[Path]) -> str:
     return "\n".join(lines)
 
 
+def render_file(p: Path, opts: argparse.Namespace) -> str:
+    try:
+        source = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"<illisible: {e}>"
+    ext = p.suffix.lower()
+    if opts.signatures:
+        sig = langs.signatures(source, ext)
+        if sig is not None:
+            source = sig  # sinon : repli silencieux sur le contenu intégral
+    return transform(source, ext, opts)
+
+
 def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
     """Sortie XML : balises explicites pour maximiser l'attention du LLM.
 
@@ -583,22 +219,9 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
         out += [f'<file path="{rel}">', render_file(p, opts), "</file>"]
     out.append("</files>")
     if opts.callgraph:
-        for lang, graph in build_callgraph(files, root) or []:
-            out += [f'<call_graph lang="{lang}">', graph, "</call_graph>"]
+        for name, graph in langs.build_callgraph(files, root) or []:
+            out += [f'<call_graph lang="{name}">', graph, "</call_graph>"]
     return "\n".join(out) + "\n"
-
-
-def render_file(p: Path, opts: argparse.Namespace) -> str:
-    try:
-        source = p.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        return f"<illisible: {e}>"
-    ext = p.suffix.lower()
-    if opts.signatures and ext in EXT_LANG:
-        sig = to_signatures(source, EXT_LANG[ext])
-        if sig is not None:
-            source = sig  # sinon : repli silencieux sur le contenu intégral
-    return transform(source, ext, opts)
 
 
 # --------------------------------------------------------------------------- #
@@ -668,9 +291,7 @@ def do_setup() -> int:
         print(f"✗ Échec (modules 'venv'/'ensurepip' requis dans Python) : {e}",
               file=sys.stderr)
         return 2
-    pkgs = ["tree-sitter", "tree-sitter-go", "tree-sitter-c-sharp", "tree-sitter-c",
-            "tree-sitter-cpp", "tree-sitter-javascript", "tree-sitter-typescript",
-            "tree-sitter-robot", "tiktoken"]
+    pkgs = ["tree-sitter", *langs.grammar_packages(), "tiktoken"]
     print(f"→ Installation (internet requis) : {', '.join(pkgs)}", file=sys.stderr)
     r = subprocess.run([str(_venv_python()), "-m", "pip", "install", "-q", *pkgs])
     if r.returncode != 0:
@@ -679,49 +300,6 @@ def do_setup() -> int:
     print("✓ Setup terminé — `--signatures`/`--callgraph` et tiktoken sont actifs.",
           file=sys.stderr)
     return 0
-
-
-# --------------------------------------------------------------------------- #
-# Filtrage par langage (--lang, exclusif de --include)
-# --------------------------------------------------------------------------- #
-
-# Langage → extensions. Noms canoniques = abréviations (mêmes langages que --signatures).
-LANG_EXTS = {
-    "go":  [".go"],
-    "cs":  [".cs"],
-    "c":   [".c", ".h"],
-    "c++": [".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h"],
-    "js":  [".js", ".jsx", ".mjs", ".cjs"],
-    "ts":  [".ts", ".mts", ".cts", ".tsx"],
-    "rf":  [".robot", ".resource"],
-}
-# Noms longs tolérés en entrée → abréviation canonique.
-LANG_ALIASES = {
-    "golang": "go", "c#": "cs", "csharp": "cs",
-    "cpp": "c++", "cxx": "c++", "cc": "c++",
-    "javascript": "js", "node": "js", "typescript": "ts",
-    "robot": "rf", "robotframework": "rf",
-}
-
-
-def _resolve_langs(spec: str) -> list[str] | None:
-    """Convertit 'go,cs' en liste d'extensions. None (+ message) si langage inconnu."""
-    exts: list[str] = []
-    unknown: list[str] = []
-    for raw in spec.split(","):
-        name = raw.strip().lower()
-        if not name:
-            continue
-        name = LANG_ALIASES.get(name, name)
-        if name in LANG_EXTS:
-            exts += LANG_EXTS[name]
-        else:
-            unknown.append(raw.strip())
-    if unknown:
-        print(f"Erreur: langage(s) inconnu(s) : {', '.join(unknown)}.\n"
-              f"Abréviations valides : {', '.join(LANG_EXTS)}.", file=sys.stderr)
-        return None
-    return exts
 
 
 # --------------------------------------------------------------------------- #
@@ -780,9 +358,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.compress:
         args.strip_comments = args.strip_blank = True
     if args.lang:  # exclusif de --include (garanti par argparse)
-        args.include = _resolve_langs(args.lang)
-        if args.include is None:
+        exts, unknown = langs.resolve_filter(args.lang)
+        if unknown:
+            print(f"Erreur: langage(s) inconnu(s) : {', '.join(unknown)}.\n"
+                  f"Abréviations valides : {', '.join(langs.FILTER_NAMES)}.",
+                  file=sys.stderr)
             return 2
+        args.include = exts
     else:
         args.include = ([e.strip() for e in args.include.split(",")]
                         if args.include else None)
@@ -802,13 +384,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     output = build_xml(root, files, args)
-    if (args.signatures or args.callgraph) and _missing_langs:
-        miss = ", ".join(sorted(_missing_langs))
+    if (args.signatures or args.callgraph) and langs.MISSING:
+        miss = ", ".join(sorted(langs.MISSING))
         print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "
               f"Active-le une fois avec : python {Path(__file__).name} --setup",
               file=sys.stderr)
     elif args.callgraph and "<call_graph" not in output:
-        print("ℹ callgraph : généré uniquement pour Go, C# et Robot "
+        print(f"ℹ callgraph : généré uniquement pour {', '.join(langs.CALLGRAPH_NAMES)} "
               "(aucun fichier concerné ici).", file=sys.stderr)
     tokens, method = estimate_tokens(output)
 

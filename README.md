@@ -77,9 +77,19 @@ chaque exécution.
 | `--include EXT,…` | liste blanche d'extensions |
 | `--lang LANG,…` | n'inclure qu'un/des langage(s) — `Go CS C C++ JS TS RF` ; exclusif de `--include` |
 | `--exclude GLOB,…` | motifs à exclure |
+| `--no-mask-secrets` | désactive le masquage des secrets (**actif par défaut**) |
 | `--no-tree` | sans arborescence |
 | `--max-size KB` | saute les fichiers volumineux (défaut 512) |
 | `--keep-empty` | garde les fichiers vides |
+
+Le **masquage de secrets** (équivalent léger du SecretLint) est **actif
+par défaut** : il remplace par `[redacted]` les clés privées (`-----BEGIN ... PRIVATE
+KEY-----`), tokens GitHub/AWS/Slack/Google/Stripe, JWT, et affectations
+`password|secret|api_key="..."`. On **masque** au lieu d'exclure le fichier — le code
+reste lisible. Un récap s'affiche sur stderr quand quelque chose est masqué ;
+`--no-mask-secrets` désactive complètement la passe. C'est une heuristique haute
+confiance, pas exhaustive : un complément de prudence, pas un substitut à une vraie
+gestion de secrets.
 
 Le **callgraph** est une heuristique *syntaxique* (tree-sitter) limitée aux appels
 **intra-projet** : les appels stdlib/bibliothèques sont écartés. Les appelants sont

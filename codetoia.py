@@ -161,6 +161,49 @@ def transform(text: str, ext: str, opts: argparse.Namespace) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Masquage de secrets (--mask-secrets) : détection regex haute confiance
+# --------------------------------------------------------------------------- #
+
+_REDACTED = "[redacted]"
+
+# (nom, motif, groupe à masquer). groupe 0 = tout le match ; sinon on ne masque
+# que la valeur capturée (on garde la clé/le contexte autour).
+_SECRET_RULES = [
+    ("clé-privée", re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.DOTALL), 0),
+    ("aws-access-key-id", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), 0),
+    ("github-token", re.compile(r"\bgh[opsru]_[A-Za-z0-9]{36,}\b"), 0),
+    ("github-pat", re.compile(r"\bgithub_pat_[0-9A-Za-z_]{60,}\b"), 0),
+    ("slack-token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"), 0),
+    ("slack-webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"), 0),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), 0),
+    ("stripe-clé-live", re.compile(r"\b[sr]k_live_[0-9a-zA-Z]{20,}\b"), 0),
+    ("jwt", re.compile(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), 0),
+    ("secret-assigné", re.compile(
+        r"""(?i)\b(passwd|password|secret|api[_-]?key|access[_-]?token|auth[_-]?token"""
+        r"""|client[_-]?secret|private[_-]?key)\b\s*[:=]\s*(['"])([^'"\n]{6,})\2"""), 3),
+]
+
+_SECRET_HITS: list[tuple[str, str]] = []  # (fichier, type) accumulés sur le run
+
+
+def mask_secrets(text: str, rel: str) -> str:
+    """Remplace les secrets détectés par [redacted] et enregistre les trouvailles."""
+    for name, rx, grp in _SECRET_RULES:
+        def repl(m, name=name, grp=grp):
+            _SECRET_HITS.append((rel, name))
+            if grp == 0:
+                return _REDACTED
+            whole = m.group(0)
+            a, b = m.start(grp) - m.start(0), m.end(grp) - m.start(0)
+            return whole[:a] + _REDACTED + whole[b:]
+        text = rx.sub(repl, text)
+    return text
+
+
+# --------------------------------------------------------------------------- #
 # Sortie XML
 # --------------------------------------------------------------------------- #
 
@@ -184,12 +227,14 @@ def render_tree(root: Path, files: list[Path]) -> str:
     return "\n".join(lines)
 
 
-def render_file(p: Path, opts: argparse.Namespace) -> str:
+def render_file(p: Path, rel: str, opts: argparse.Namespace) -> str:
     try:
         source = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"<illisible: {e}>"
     ext = p.suffix.lower()
+    if opts.mask_secrets:
+        source = mask_secrets(source, rel)  # avant tout traitement
     if opts.signatures:
         sig = langs.signatures(source, ext)
         if sig is not None:
@@ -216,7 +261,7 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
     out.append("<files>")
     for p in files:
         rel = str(p.relative_to(root)).replace(os.sep, "/")
-        out += [f'<file path="{rel}">', render_file(p, opts), "</file>"]
+        out += [f'<file path="{rel}">', render_file(p, rel, opts), "</file>"]
     out.append("</files>")
     if opts.callgraph:
         for name, graph in langs.build_callgraph(files, root) or []:
@@ -345,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Installe (une fois, internet requis) tree-sitter & tiktoken "
                          "dans un .venv local pour activer --signatures/--callgraph. "
                          "Ensuite le script s'en sert automatiquement.")
+    ap.add_argument("--no-mask-secrets", dest="mask_secrets", action="store_false",
+                    help="Désactive le masquage des secrets (actif par défaut : clés "
+                         "privées, tokens, secret=\"...\" → [redacted]).")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
@@ -383,7 +431,13 @@ def main(argv: list[str] | None = None) -> int:
         print("Aucun fichier source trouvé.", file=sys.stderr)
         return 1
 
+    _SECRET_HITS.clear()
     output = build_xml(root, files, args)
+    if args.mask_secrets and _SECRET_HITS:
+        kinds = ", ".join(sorted({k for _, k in _SECRET_HITS}))
+        nfiles = len({f for f, _ in _SECRET_HITS})
+        print(f"🔒 {len(_SECRET_HITS)} secret(s) masqué(s) dans {nfiles} fichier(s) "
+              f"[{kinds}]", file=sys.stderr)
     if (args.signatures or args.callgraph) and langs.MISSING:
         miss = ", ".join(sorted(langs.MISSING))
         print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "

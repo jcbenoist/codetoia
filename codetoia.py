@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 jcb — développé avec l'assistance de Claude (Anthropic).
 """codetoia — regroupe les sources d'un dépôt git en un bloc XML copiable pour une IA.
 
 Objectif : sortie la plus compacte possible (économie de tokens) tout en restant
@@ -9,8 +11,8 @@ Tout ce qui est spécifique à un langage (grammaire, signatures, graphe d'appel
 commentaires) vit dans le package `codetoia_langs/` (un module par langage).
 
 Usage :
-    python codetoia.py .              # tout le dépôt → presse-papier (+ résumé tokens)
-    python codetoia.py . -o dump.xml  # → fichier
+    python codetoia.py .              # → fichier <repo>-dump.xml dans le dossier courant
+    python codetoia.py . -o dump.xml  # → fichier nommé explicitement
     python codetoia.py . --compress   # retire commentaires + lignes vides (gain max)
     python codetoia.py . --signatures   # Go/CS/C/C++/JS/TS/RF : signatures seules
     python codetoia.py . --architecture # = --signatures + --callgraph
@@ -294,6 +296,35 @@ def to_clipboard(text: str) -> bool:
     return False
 
 
+def output_name(root: Path, args: argparse.Namespace) -> str:
+    """Nom de fichier par défaut : <repo>-<options>-dump.xml (options rappelées)."""
+    parts = [root.resolve().name]
+    if args.architecture:
+        parts.append("architecture")
+    else:
+        if args.signatures:
+            parts.append("signatures")
+        if args.callgraph:
+            parts.append("callgraph")
+    if args.compress:
+        parts.append("compress")
+    else:
+        if args.strip_comments:
+            parts.append("nocomments")
+        if args.strip_blank:
+            parts.append("noblank")
+    if args.lang:
+        parts.append(args.lang)
+    elif args.include:
+        parts.append("inc-" + ",".join(args.include))
+    if not args.mask_secrets:
+        parts.append("nomask")
+    if args.no_tree:
+        parts.append("notree")
+    safe = [s for s in (re.sub(r"[^A-Za-z0-9]+", "-", p).strip("-") for p in parts) if s]
+    return "-".join(safe) + "-dump.xml"
+
+
 # --------------------------------------------------------------------------- #
 # Bootstrap : .venv local pour activer --signatures/--callgraph sans gérer de venv
 # --------------------------------------------------------------------------- #
@@ -361,10 +392,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Regroupe les sources d'un dépôt git en un bloc XML pour une IA.",
     )
     ap.add_argument("path", nargs="?", default=".", help="Racine du dépôt (défaut: .)")
-    ap.add_argument("-o", "--output", help="Fichier de sortie (sinon: presse-papier)")
+    ap.add_argument("-o", "--output",
+                    help="Fichier de sortie (défaut: <repo>-<options>-dump.xml "
+                         "dans le répertoire courant)")
     ap.add_argument("--stdout", action="store_true", help="Écrit le dump sur stdout")
     ap.add_argument("-c", "--clipboard", action="store_true",
-                    help="Force la copie vers le presse-papier")
+                    help="Copie aussi vers le presse-papier (en plus du fichier)")
     sel = ap.add_mutually_exclusive_group()
     sel.add_argument("--include", metavar="EXT", help="Extensions à inclure (ex: py,ts,md)")
     sel.add_argument("--lang", metavar="LANG",
@@ -455,17 +488,12 @@ def main(argv: list[str] | None = None) -> int:
     summary = (f"✓ {len(files)} fichiers — {len(output):,} caractères — "
                f"~{tokens:,} tokens ({method})").replace(",", " ")
 
-    if args.output:
-        Path(args.output).write_text(output, encoding="utf-8")
-        print(f"{summary}\n→ écrit dans {args.output}", file=sys.stderr)
-        if args.clipboard and to_clipboard(output):
-            print("→ copié dans le presse-papier", file=sys.stderr)
-    elif to_clipboard(output):
-        print(f"{summary}\n→ copié dans le presse-papier", file=sys.stderr)
-    else:
-        print(f"{summary}\n(presse-papier indisponible — utilise -o ou --stdout)",
-              file=sys.stderr)
-        sys.stdout.write(output)
+    # Par défaut : fichier auto-nommé dans le répertoire courant. -o le surcharge.
+    target = Path(args.output) if args.output else Path(output_name(root, args))
+    target.write_text(output, encoding="utf-8")
+    print(f"{summary}\n→ écrit dans {target}", file=sys.stderr)
+    if args.clipboard and to_clipboard(output):
+        print("→ copié aussi dans le presse-papier", file=sys.stderr)
     return 0
 
 

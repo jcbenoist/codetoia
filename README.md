@@ -7,9 +7,10 @@ contenu intégral.
 ## Utilisation
 
 ```bash
-python3 codetoia.py .                  # tout le dépôt → presse-papier (+ résumé tokens)
-python3 codetoia.py . -o dump.xml      # → fichier
+python3 codetoia.py .                  # → fichier <repo>-dump.xml dans le dossier courant
+python3 codetoia.py . -o dump.xml      # → fichier nommé explicitement
 python3 codetoia.py . --stdout         # → sortie standard
+python3 codetoia.py . -c               # → fichier + copie presse-papier
 python3 codetoia.py . --compress       # gain max : retire commentaires + lignes vides
 python3 codetoia.py . --signatures     # signatures seules (Go/CS/C/C++/JS/TS/RF)
 python3 codetoia.py . --callgraph      # ajoute le graphe d'appel (Go, C#, Robot)
@@ -20,6 +21,12 @@ python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
 
 Le répertoire doit être un dépôt git (sinon erreur).
+
+**Sortie par défaut** : un fichier écrit dans le répertoire courant, nommé
+`<repo>-<options>-dump.xml` où les options actives sont rappelées (ex.
+`deadthisday-architecture-dump.xml`, `monrepo-signatures-compress-go-dump.xml`).
+`-o` impose un nom, `--stdout` écrit sur la sortie standard, `-c` ajoute une copie
+dans le presse-papier.
 
 ## Économie de tokens — comment
 
@@ -66,9 +73,9 @@ chaque exécution.
 
 | Option | Effet |
 |--------|-------|
-| `-o, --output` | écrit dans un fichier |
+| `-o, --output` | nom de fichier explicite (sinon `<repo>-<options>-dump.xml`) |
 | `--stdout` | écrit sur la sortie standard |
-| `-c, --clipboard` | force la copie presse-papier |
+| `-c, --clipboard` | copie *aussi* dans le presse-papier (en plus du fichier) |
 | `--signatures` | Go/CS/C/C++/JS/TS/RF : ne garder que les signatures (corps → `{ ... }`) |
 | `--callgraph` | ajoute `<call_graph>` (Go, C#, Robot) : appelant→appelés + index inversé appelés←appelants (analyse d'impact) ; une section par langage |
 | `--architecture` | raccourci : `--signatures` + `--callgraph` |
@@ -142,3 +149,10 @@ l'ajouter à la liste `LANGS` du `__init__`. Le cœur ne change pas.
 
 À déployer : copier `codetoia.py` **et** le dossier `codetoia_langs/` (le `.venv`
 créé par `--setup` reste, lui, propre à chaque machine).
+
+## Licence
+
+[MIT](LICENSE) — librement utilisable, modifiable et redistribuable, à condition de
+conserver l'avis de copyright et le texte de licence (c'est l'attribution).
+
+Auteur : **jcb** — développé avec l'assistance de **Claude** (Anthropic).

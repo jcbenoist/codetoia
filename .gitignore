@@ -8,9 +8,8 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 
-# Sorties générées
-dump.xml
-*.dump.xml
+# Sorties générées (nommage par défaut <repo>-<options>-dump.xml)
+*dump.xml
 
 # OS
 .DS_Store

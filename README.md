@@ -11,6 +11,7 @@ python3 codetoia.py .                  # tout le dépôt → presse-papier (+ r�
 python3 codetoia.py . -o dump.xml      # → fichier
 python3 codetoia.py . --stdout         # → sortie standard
 python3 codetoia.py . --compress       # gain max : retire commentaires + lignes vides
+python3 codetoia.py . --signatures     # Go & C# : ne garder que les signatures
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
@@ -72,11 +73,28 @@ chaque exécution.
 | `--max-size KB` | saute les fichiers volumineux (défaut 512) |
 | `--keep-empty` | garde les fichiers vides |
 
-## Dépendances optionnelles
+## Mode signatures : installation
 
-Aucune dépendance obligatoire — le script tourne tel quel.
+`--signatures` et le comptage exact des tokens reposent sur des libs natives
+(`tree-sitter`, `tiktoken`). Le cœur du script n'en dépend pas — sans elles, il
+tourne quand même (repli sur le contenu intégral + estimation chars/4).
 
-- `pip install tiktoken` → comptage de tokens exact (sinon estimation chars/4).
-- `pip install tree-sitter tree-sitter-go tree-sitter-c-sharp` → active `--signatures`.
-  Si absent, `--signatures` affiche un avertissement et conserve le contenu intégral
-  (le script s'exécute quand même).
+Pour les activer, **une seule commande, une fois par machine** (internet requis) :
+
+```bash
+python3 codetoia.py --setup
+```
+
+Elle crée un `.venv` à côté du script et y installe les libs. Ensuite, tu continues
+à lancer la commande habituelle :
+
+```bash
+python3 codetoia.py . --signatures
+```
+
+Le script détecte son `.venv` et **se relance dedans automatiquement** — tu n'as
+jamais à activer ni gérer le venv toi-même. Sur une machine sans `--setup` (ou hors
+ligne), `--signatures` affiche un avertissement et conserve le contenu intégral.
+
+Prérequis : un Python disposant des modules standard `venv` et `ensurepip` (présents
+dans toute install standard ; sur Debian/Ubuntu minimal : `apt install python3-venv`).

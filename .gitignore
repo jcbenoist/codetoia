@@ -1,0 +1,17 @@
+# Environnement créé par `codetoia.py --setup`
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Sorties générées
+dump.xml
+*.dump.xml
+
+# OS
+.DS_Store
+Thumbs.db

@@ -9,6 +9,8 @@ Usage :
     python codetoia.py .              # tout le dépôt → presse-papier (+ résumé tokens)
     python codetoia.py . -o dump.xml  # → fichier
     python codetoia.py . --compress   # retire commentaires + lignes vides (gain max)
+    python codetoia.py . --signatures # Go & C# : ne garder que les signatures
+    python codetoia.py --setup        # installe (1 fois) les libs de --signatures
 """
 from __future__ import annotations
 
@@ -357,10 +359,67 @@ def to_clipboard(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Bootstrap : .venv local pour activer --signatures sans gérer de venv soi-même
+# --------------------------------------------------------------------------- #
+
+def _venv_dir() -> Path:
+    return Path(__file__).resolve().parent / ".venv"
+
+
+def _venv_python() -> Path:
+    sub = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    return _venv_dir() / sub
+
+
+def _maybe_reexec(args_list: list[str]) -> None:
+    """Si un .venv local existe, relance le script avec SON Python (libs dispo).
+
+    Transparent pour l'utilisateur : il tape toujours `python codetoia.py …`.
+    Une variable d'environnement évite toute boucle de relance.
+    """
+    if os.environ.get("CODETOIA_REEXEC"):
+        return
+    py = _venv_python()
+    try:
+        same = py.resolve() == Path(sys.executable).resolve()
+    except OSError:
+        same = False
+    if py.exists() and not same:
+        os.environ["CODETOIA_REEXEC"] = "1"
+        os.execv(str(py), [str(py), str(Path(__file__).resolve()), *args_list])
+
+
+def do_setup() -> int:
+    """Crée le .venv local et y installe tree-sitter + tiktoken (internet requis)."""
+    import venv as _venv
+    venv_dir = _venv_dir()
+    print(f"→ Création de l'environnement : {venv_dir}", file=sys.stderr)
+    try:
+        _venv.create(venv_dir, with_pip=True, clear=True)
+    except Exception as e:
+        print(f"✗ Échec (modules 'venv'/'ensurepip' requis dans Python) : {e}",
+              file=sys.stderr)
+        return 2
+    pkgs = ["tree-sitter", "tree-sitter-go", "tree-sitter-c-sharp", "tiktoken"]
+    print(f"→ Installation (internet requis) : {', '.join(pkgs)}", file=sys.stderr)
+    r = subprocess.run([str(_venv_python()), "-m", "pip", "install", "-q", *pkgs])
+    if r.returncode != 0:
+        print("✗ Installation échouée (vérifie la connexion internet).", file=sys.stderr)
+        return 1
+    print("✓ Setup terminé — `--signatures` et le comptage tiktoken sont actifs.",
+          file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
 def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    if "--setup" not in raw:
+        _maybe_reexec(raw)  # remplace le process si un .venv local existe
+
     ap = argparse.ArgumentParser(
         prog="codetoia",
         description="Regroupe les sources d'un dépôt git en un bloc XML pour une IA.",
@@ -380,12 +439,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--signatures", action="store_true",
                     help="Go & C#: ne garder que les signatures (corps → { ... }). "
                          "Repli sur le contenu intégral si tree-sitter absent.")
+    ap.add_argument("--setup", action="store_true",
+                    help="Installe (une fois, internet requis) tree-sitter & tiktoken "
+                         "dans un .venv local pour activer --signatures. Ensuite le "
+                         "script s'en sert automatiquement.")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
     ap.add_argument("--keep-empty", action="store_true", help="Garde les fichiers vides")
     args = ap.parse_args(argv)
 
+    if args.setup:
+        return do_setup()
     if args.compress:
         args.strip_comments = args.strip_blank = True
     args.include = [e.strip() for e in args.include.split(",")] if args.include else None
@@ -406,10 +471,9 @@ def main(argv: list[str] | None = None) -> int:
 
     output = build_xml(root, files, args)
     if args.signatures and _missing_langs:
-        miss = sorted(_missing_langs)
-        pkgs = " ".join("tree-sitter-" + l.replace("_", "-") for l in miss)
-        print(f"⚠ Mode signatures indisponible pour {', '.join(miss)} "
-              f"(contenu intégral conservé). Installe: pip install tree-sitter {pkgs}",
+        miss = ", ".join(sorted(_missing_langs))
+        print(f"⚠ Mode signatures indisponible pour {miss} (contenu intégral conservé). "
+              f"Active-le une fois avec : python {Path(__file__).name} --setup",
               file=sys.stderr)
     tokens, method = estimate_tokens(output)
 

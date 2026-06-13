@@ -24,10 +24,11 @@ Le répertoire doit être un dépôt git (sinon erreur).
    `git ls-files --exclude-standard` (fichiers suivis + non-suivis non-ignorés),
    donc le `.gitignore`, `.git/info/exclude` et le gitignore global sont respectés
    exactement. En plus : lock files, binaires et images exclus d'office.
-2. **`--signatures`** (Go & C#) : ne garde que les signatures — corps de fonctions
-   remplacés par `{ ... }`, types/structs/interfaces/imports/commentaires conservés.
-   Vue « architecture » d'un gros projet à coût minimal (~40 % de tokens en moins
-   mesuré sur un projet Go).
+2. **`--signatures`** (Go, C#, C, C++, Robot Framework) : ne garde que les signatures.
+   Corps de fonctions remplacés par `{ ... }` (étapes Robot par `...`) ;
+   types/structs/interfaces/imports/commentaires — et `[Arguments]`/`[Documentation]`
+   en Robot — conservés. Vue « architecture » d'un gros projet à coût minimal
+   (~40 % de tokens en moins mesuré sur un projet Go).
 3. **`--compress`** : suppression des commentaires (best-effort) et lignes vides.
 4. **Toujours** : espaces de fin coupés, lignes vides multiples réduites à une.
 
@@ -64,7 +65,7 @@ chaque exécution.
 | `-o, --output` | écrit dans un fichier |
 | `--stdout` | écrit sur la sortie standard |
 | `-c, --clipboard` | force la copie presse-papier |
-| `--signatures` | Go & C# : ne garder que les signatures (corps → `{ ... }`) |
+| `--signatures` | Go, C#, C, C++, Robot : ne garder que les signatures (corps → `{ ... }`) |
 | `--compress` | `--strip-comments` + `--strip-blank` |
 | `--strip-comments` / `--strip-blank` | au choix |
 | `--include EXT,…` | liste blanche d'extensions |

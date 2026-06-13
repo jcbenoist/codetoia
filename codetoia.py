@@ -9,7 +9,7 @@ Usage :
     python codetoia.py .              # tout le dépôt → presse-papier (+ résumé tokens)
     python codetoia.py . -o dump.xml  # → fichier
     python codetoia.py . --compress   # retire commentaires + lignes vides (gain max)
-    python codetoia.py . --signatures # Go & C# : ne garder que les signatures
+    python codetoia.py . --signatures # Go, C#, C, C++, Robot : signatures seules
     python codetoia.py --setup        # installe (1 fois) les libs de --signatures
 """
 from __future__ import annotations
@@ -177,11 +177,22 @@ def transform(text: str, ext: str, opts: argparse.Namespace) -> str:
 # Mode signatures (Tree-sitter) — Go & C#
 # --------------------------------------------------------------------------- #
 
-EXT_LANG = {".go": "go", ".cs": "c_sharp"}
-_LANG_MODULES = {"go": "tree_sitter_go", "c_sharp": "tree_sitter_c_sharp"}
+EXT_LANG = {
+    ".go": "go",
+    ".cs": "c_sharp",
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".c++": "cpp",
+    ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
+    ".robot": "robot", ".resource": "robot",
+}
+_LANG_MODULES = {
+    "go": "tree_sitter_go", "c_sharp": "tree_sitter_c_sharp",
+    "c": "tree_sitter_c", "cpp": "tree_sitter_cpp", "robot": "tree_sitter_robot",
+}
 
-# Nœuds dont on remplace le corps par un placeholder ; tout le reste est conservé
-# (signatures, types/structs/interfaces, imports, commentaires).
+# Langages « à accolades » : on remplace le corps de ces nœuds par { ... } ; tout le
+# reste est conservé (signatures, types/structs/interfaces, imports, commentaires).
+# Robot Framework est traité à part dans _collect_bodies (pas d'accolades).
 _BODY_CONTAINERS = {
     "go": {"function_declaration", "method_declaration", "func_literal"},
     "c_sharp": {
@@ -189,6 +200,8 @@ _BODY_CONTAINERS = {
         "operator_declaration", "conversion_operator_declaration",
         "local_function_statement", "accessor_declaration",
     },
+    "c": {"function_definition"},
+    "cpp": {"function_definition"},
 }
 
 _parsers: dict[str, object | None] = {}  # cache (None = grammaire indisponible)
@@ -233,13 +246,29 @@ def _body_node(node):
     body = node.child_by_field_name("body")
     if body is not None:
         return body
-    for child in node.children:  # repli : corps de méthode (block) ou flèche C#
-        if child.type in ("block", "arrow_expression_clause"):
+    for child in node.children:  # repli : block (méthode), flèche C#, ou C/C++
+        if child.type in ("block", "arrow_expression_clause", "compound_statement"):
             return child
     return None
 
 
+def _collect_robot_bodies(node, edits: list) -> None:
+    """Robot Framework : garde le nom + les [Settings], remplace les étapes par `...`."""
+    if node.type in ("keyword_definition", "test_case_definition"):
+        body = next((c for c in node.children if c.type == "body"), None)
+        if body is not None:
+            steps = [c for c in body.children if c.type == "statement"]
+            if steps:
+                edits.append((steps[0].start_byte, steps[-1].end_byte, b"..."))
+        return
+    for child in node.children:
+        _collect_robot_bodies(child, edits)
+
+
 def _collect_bodies(node, lang: str, edits: list) -> None:
+    if lang == "robot":
+        _collect_robot_bodies(node, edits)
+        return
     if node.type in _BODY_CONTAINERS[lang]:
         body = _body_node(node)
         if body is not None and body.end_byte > body.start_byte:
@@ -400,7 +429,8 @@ def do_setup() -> int:
         print(f"✗ Échec (modules 'venv'/'ensurepip' requis dans Python) : {e}",
               file=sys.stderr)
         return 2
-    pkgs = ["tree-sitter", "tree-sitter-go", "tree-sitter-c-sharp", "tiktoken"]
+    pkgs = ["tree-sitter", "tree-sitter-go", "tree-sitter-c-sharp", "tree-sitter-c",
+            "tree-sitter-cpp", "tree-sitter-robot", "tiktoken"]
     print(f"→ Installation (internet requis) : {', '.join(pkgs)}", file=sys.stderr)
     r = subprocess.run([str(_venv_python()), "-m", "pip", "install", "-q", *pkgs])
     if r.returncode != 0:
@@ -437,7 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--compress", action="store_true",
                     help="Raccourci: --strip-comments --strip-blank")
     ap.add_argument("--signatures", action="store_true",
-                    help="Go & C#: ne garder que les signatures (corps → { ... }). "
+                    help="Go, C#, C, C++, Robot: ne garder que les signatures "
+                         "(corps → { ... } / étapes → ...). "
                          "Repli sur le contenu intégral si tree-sitter absent.")
     ap.add_argument("--setup", action="store_true",
                     help="Installe (une fois, internet requis) tree-sitter & tiktoken "

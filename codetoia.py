@@ -9,8 +9,8 @@ Usage :
     python codetoia.py .              # tout le dépôt → presse-papier (+ résumé tokens)
     python codetoia.py . -o dump.xml  # → fichier
     python codetoia.py . --compress   # retire commentaires + lignes vides (gain max)
-    python codetoia.py . --signatures # Go, C#, C, C++, Robot : signatures seules
-    python codetoia.py --setup        # installe (1 fois) les libs de --signatures
+    python codetoia.py . --architecture # Go/C#/C/C++/JS/TS/Robot : signatures seules
+    python codetoia.py --setup        # installe (1 fois) les libs de --architecture
 """
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ def transform(text: str, ext: str, opts: argparse.Namespace) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Mode signatures (Tree-sitter) — Go & C#
+# Mode architecture (Tree-sitter) : ne garder que les signatures
 # --------------------------------------------------------------------------- #
 
 EXT_LANG = {
@@ -183,16 +183,33 @@ EXT_LANG = {
     ".c": "c", ".h": "c",
     ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".c++": "cpp",
     ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
+    ".tsx": "tsx",
     ".robot": "robot", ".resource": "robot",
 }
-_LANG_MODULES = {
-    "go": "tree_sitter_go", "c_sharp": "tree_sitter_c_sharp",
-    "c": "tree_sitter_c", "cpp": "tree_sitter_cpp", "robot": "tree_sitter_robot",
+
+# lang → (module pip importable, fonction renvoyant la grammaire). tree-sitter-typescript
+# expose deux grammaires (language_typescript / language_tsx) au lieu de language().
+_LANG_GRAMMARS = {
+    "go": ("tree_sitter_go", "language"),
+    "c_sharp": ("tree_sitter_c_sharp", "language"),
+    "c": ("tree_sitter_c", "language"),
+    "cpp": ("tree_sitter_cpp", "language"),
+    "javascript": ("tree_sitter_javascript", "language"),
+    "typescript": ("tree_sitter_typescript", "language_typescript"),
+    "tsx": ("tree_sitter_typescript", "language_tsx"),
+    "robot": ("tree_sitter_robot", "language"),
 }
 
-# Langages « à accolades » : on remplace le corps de ces nœuds par { ... } ; tout le
-# reste est conservé (signatures, types/structs/interfaces, imports, commentaires).
-# Robot Framework est traité à part dans _collect_bodies (pas d'accolades).
+# Nœuds-fonctions dont on remplace le corps par { ... } ; tout le reste est conservé
+# (signatures, types/structs/interfaces, imports, commentaires). Seuls les corps de
+# type « bloc » (_BLOCK_BODY_TYPES) sont repliés ; un corps-expression (arrow JS court)
+# est laissé tel quel. Robot Framework est traité à part (pas d'accolades).
+_JS_CONTAINERS = {
+    "function_declaration", "function_expression", "arrow_function",
+    "method_definition", "generator_function", "generator_function_declaration",
+}
 _BODY_CONTAINERS = {
     "go": {"function_declaration", "method_declaration", "func_literal"},
     "c_sharp": {
@@ -202,7 +219,13 @@ _BODY_CONTAINERS = {
     },
     "c": {"function_definition"},
     "cpp": {"function_definition"},
+    "javascript": _JS_CONTAINERS,
+    "typescript": _JS_CONTAINERS,
+    "tsx": _JS_CONTAINERS,
 }
+
+# Corps repliables en { ... } selon la grammaire.
+_BLOCK_BODY_TYPES = {"block", "statement_block", "compound_statement"}
 
 _parsers: dict[str, object | None] = {}  # cache (None = grammaire indisponible)
 _missing_langs: set[str] = set()
@@ -210,13 +233,14 @@ _missing_langs: set[str] = set()
 
 def _load_parser(lang: str):
     """Construit un parser Tree-sitter, robuste aux versions d'API. None si KO."""
+    module_name, func_name = _LANG_GRAMMARS[lang]
     try:
         import tree_sitter
-        module = importlib.import_module(_LANG_MODULES[lang])
+        module = importlib.import_module(module_name)
     except Exception:
         return None
     try:
-        capsule = module.language()
+        capsule = getattr(module, func_name)()
         try:
             language = tree_sitter.Language(capsule)        # tree_sitter >= 0.22
         except TypeError:
@@ -246,8 +270,8 @@ def _body_node(node):
     body = node.child_by_field_name("body")
     if body is not None:
         return body
-    for child in node.children:  # repli : block (méthode), flèche C#, ou C/C++
-        if child.type in ("block", "arrow_expression_clause", "compound_statement"):
+    for child in node.children:  # repli : bloc, flèche C#
+        if child.type in _BLOCK_BODY_TYPES or child.type == "arrow_expression_clause":
             return child
     return None
 
@@ -272,14 +296,18 @@ def _collect_bodies(node, lang: str, edits: list) -> None:
     if node.type in _BODY_CONTAINERS[lang]:
         body = _body_node(node)
         if body is not None and body.end_byte > body.start_byte:
-            rep = b"=> ..." if body.type == "arrow_expression_clause" else b"{ ... }"
-            edits.append((body.start_byte, body.end_byte, rep))
-            return  # ne pas descendre dans le corps qu'on vient de remplacer
+            if body.type == "arrow_expression_clause":          # C# `=> expr`
+                edits.append((body.start_byte, body.end_byte, b"=> ..."))
+                return
+            if body.type in _BLOCK_BODY_TYPES:                  # corps à accolades
+                edits.append((body.start_byte, body.end_byte, b"{ ... }"))
+                return
+            # corps-expression (arrow JS court `=> x*x`) : on garde, on descend quand même
     for child in node.children:
         _collect_bodies(child, lang, edits)
 
 
-def to_signatures(source: str, lang: str) -> str | None:
+def to_architecture(source: str, lang: str) -> str | None:
     """Garde signatures + types, remplace les corps de fonctions par `{ ... }`.
 
     None si Tree-sitter ou la grammaire est indisponible (→ repli appelant).
@@ -355,10 +383,10 @@ def render_file(p: Path, opts: argparse.Namespace) -> str:
     except OSError as e:
         return f"<illisible: {e}>"
     ext = p.suffix.lower()
-    if opts.signatures and ext in EXT_LANG:
-        sig = to_signatures(source, EXT_LANG[ext])
-        if sig is not None:
-            source = sig  # sinon : repli silencieux sur le contenu intégral
+    if opts.architecture and ext in EXT_LANG:
+        arch = to_architecture(source, EXT_LANG[ext])
+        if arch is not None:
+            source = arch  # sinon : repli silencieux sur le contenu intégral
     return transform(source, ext, opts)
 
 
@@ -388,7 +416,7 @@ def to_clipboard(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Bootstrap : .venv local pour activer --signatures sans gérer de venv soi-même
+# Bootstrap : .venv local pour activer --architecture sans gérer de venv soi-même
 # --------------------------------------------------------------------------- #
 
 def _venv_dir() -> Path:
@@ -430,13 +458,14 @@ def do_setup() -> int:
               file=sys.stderr)
         return 2
     pkgs = ["tree-sitter", "tree-sitter-go", "tree-sitter-c-sharp", "tree-sitter-c",
-            "tree-sitter-cpp", "tree-sitter-robot", "tiktoken"]
+            "tree-sitter-cpp", "tree-sitter-javascript", "tree-sitter-typescript",
+            "tree-sitter-robot", "tiktoken"]
     print(f"→ Installation (internet requis) : {', '.join(pkgs)}", file=sys.stderr)
     r = subprocess.run([str(_venv_python()), "-m", "pip", "install", "-q", *pkgs])
     if r.returncode != 0:
         print("✗ Installation échouée (vérifie la connexion internet).", file=sys.stderr)
         return 1
-    print("✓ Setup terminé — `--signatures` et le comptage tiktoken sont actifs.",
+    print("✓ Setup terminé — `--architecture` et le comptage tiktoken sont actifs.",
           file=sys.stderr)
     return 0
 
@@ -466,13 +495,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--strip-blank", action="store_true", help="Retire toutes les lignes vides")
     ap.add_argument("--compress", action="store_true",
                     help="Raccourci: --strip-comments --strip-blank")
-    ap.add_argument("--signatures", action="store_true",
-                    help="Go, C#, C, C++, Robot: ne garder que les signatures "
+    ap.add_argument("--architecture", action="store_true",
+                    help="Go, C#, C, C++, JS, TS, Robot: ne garder que les signatures "
                          "(corps → { ... } / étapes → ...). "
                          "Repli sur le contenu intégral si tree-sitter absent.")
     ap.add_argument("--setup", action="store_true",
                     help="Installe (une fois, internet requis) tree-sitter & tiktoken "
-                         "dans un .venv local pour activer --signatures. Ensuite le "
+                         "dans un .venv local pour activer --architecture. Ensuite le "
                          "script s'en sert automatiquement.")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
@@ -501,9 +530,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     output = build_xml(root, files, args)
-    if args.signatures and _missing_langs:
+    if args.architecture and _missing_langs:
         miss = ", ".join(sorted(_missing_langs))
-        print(f"⚠ Mode signatures indisponible pour {miss} (contenu intégral conservé). "
+        print(f"⚠ Mode architecture indisponible pour {miss} (contenu intégral conservé). "
               f"Active-le une fois avec : python {Path(__file__).name} --setup",
               file=sys.stderr)
     tokens, method = estimate_tokens(output)

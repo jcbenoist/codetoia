@@ -12,7 +12,7 @@ python3 codetoia.py . -o dump.xml      # → fichier
 python3 codetoia.py . --stdout         # → sortie standard
 python3 codetoia.py . --compress       # gain max : retire commentaires + lignes vides
 python3 codetoia.py . --signatures     # signatures seules (Go/CS/C/C++/JS/TS/RF)
-python3 codetoia.py . --callgraph      # ajoute le graphe d'appel (Go)
+python3 codetoia.py . --callgraph      # ajoute le graphe d'appel (Go, C#, Robot)
 python3 codetoia.py . --architecture   # = --signatures + --callgraph
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C/C++/JS/TS/RF
@@ -70,7 +70,7 @@ chaque exécution.
 | `--stdout` | écrit sur la sortie standard |
 | `-c, --clipboard` | force la copie presse-papier |
 | `--signatures` | Go/CS/C/C++/JS/TS/RF : ne garder que les signatures (corps → `{ ... }`) |
-| `--callgraph` | ajoute `<call_graph>` (Go) : appelant→appelés + index inversé appelés←appelants (analyse d'impact) |
+| `--callgraph` | ajoute `<call_graph>` (Go, C#, Robot) : appelant→appelés + index inversé appelés←appelants (analyse d'impact) ; une section par langage |
 | `--architecture` | raccourci : `--signatures` + `--callgraph` |
 | `--compress` | `--strip-comments` + `--strip-blank` |
 | `--strip-comments` / `--strip-blank` | au choix |
@@ -80,6 +80,13 @@ chaque exécution.
 | `--no-tree` | sans arborescence |
 | `--max-size KB` | saute les fichiers volumineux (défaut 512) |
 | `--keep-empty` | garde les fichiers vides |
+
+Le **callgraph** est une heuristique *syntaxique* (tree-sitter) limitée aux appels
+**intra-projet** : les appels stdlib/bibliothèques sont écartés. Les appelants sont
+qualifiés par dossier (Go), classe (C#) ou fichier (Robot) ; les appelés sont
+appariés par nom, donc un nom de méthode présent dans plusieurs types/classes peut
+produire une arête approximative. Pour un graphe exact, il faudrait une analyse de
+types par langage (ex. `go/callgraph`), volontairement non retenue ici.
 
 ## Modes signatures / callgraph : installation
 

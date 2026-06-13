@@ -372,61 +372,169 @@ def _go_callees(body, data: bytes):
                 yield _txt(field, data)
 
 
-def build_callgraph(files: list[Path], root: Path) -> str | None:
-    """Graphe d'appel intra-projet (Go) : sens direct + index inversé.
+# Une entrée = (label affiché, clé d'appariement | None, [clés des appelés]).
+# clé None = nœud appelant uniquement (ex. test case Robot, non appelable).
+_Func = tuple[str, "str | None", list[str]]
 
-    None si tree-sitter-go est indisponible ou s'il n'y a aucun fichier Go.
-    Heuristique syntaxique : appelés appariés par nom simple ; les labels sont
-    qualifiés par le dossier (≈ package Go) pour lever les homonymes inter-packages.
-    Un appelé dont le nom reste ambigu (plusieurs déclarations) est laissé en nom simple.
-    """
-    parser = _get_parser("go")
-    go_files = [p for p in files if p.suffix.lower() == ".go"]
-    if parser is None or not go_files:
-        return None
 
-    funcs: list[tuple[str, str, object, bytes]] = []  # (label, simple, body, data)
+def _field_name(node, data: bytes, fallback: set[str]) -> str:
+    n = node.child_by_field_name("name")
+    if n is not None:
+        return _txt(n, data)
+    for c in node.children:
+        if c.type in fallback:
+            return _txt(c, data)
+    return "?"
+
+
+def _extract_go(tree, data: bytes, qual: str) -> list[_Func]:
+    out: list[_Func] = []
+    for node in _descend(tree, {"function_declaration", "method_declaration"}):
+        rest, simple = _go_func_label(node, data)
+        body = node.child_by_field_name("body")
+        callees = list(_go_callees(body, data)) if body is not None else []
+        out.append((f"{qual}.{rest}", simple, callees))
+    return out
+
+
+def _cs_callees(body, data: bytes):
+    for call in _descend(body, {"invocation_expression"}):
+        fn = call.child_by_field_name("function")
+        if fn is None:
+            continue
+        if fn.type == "identifier":               # Foo(...)
+            yield _txt(fn, data)
+        elif fn.type == "member_access_expression":  # x.Foo(...), C.Foo(...)
+            name = fn.child_by_field_name("name")
+            if name is not None:
+                yield _txt(name, data)
+
+
+def _extract_cs(tree, data: bytes) -> list[_Func]:
+    out: list[_Func] = []
+    types = {"class_declaration", "struct_declaration", "interface_declaration",
+             "record_declaration"}
+    funcs = {"method_declaration", "constructor_declaration", "local_function_statement"}
+
+    def walk(node, cls):
+        if node.type in types:
+            cls = _field_name(node, data, {"identifier"})
+            for c in node.children:
+                walk(c, cls)
+            return
+        if node.type in funcs:
+            simple = _field_name(node, data, {"identifier"})
+            label = f"{cls}.{simple}" if cls else simple
+            body = _body_node(node)
+            callees = list(_cs_callees(body, data)) if body is not None else []
+            out.append((label, simple, callees))
+            return
+        for c in node.children:
+            walk(c, cls)
+
+    walk(tree, None)
+    return out
+
+
+def _rf_norm(name: str) -> str:
+    """Robot apparie les keywords insensibles à la casse/espaces/underscores."""
+    return name.lower().replace(" ", "").replace("_", "")
+
+
+def _rf_calls(body, data: bytes):
+    for kw in _descend(body, {"keyword"}):                 # invocation directe
+        yield _rf_norm(_txt(kw, data))
+    for va in _descend(body, {"variable_assignment"}):     # ${x}=  Mon KW  args
+        args = next((c for c in va.children if c.type == "arguments"), None)
+        if args is not None:
+            first = next(iter(args.named_children), None)   # 1er argument = le keyword
+            if first is not None:
+                yield _rf_norm(_txt(first, data))
+
+
+def _extract_rf(tree, data: bytes, qual: str) -> list[_Func]:
+    out: list[_Func] = []
+    for node in _descend(tree, {"keyword_definition", "test_case_definition"}):
+        name = _field_name(node, data, {"name"})
+        body = next((c for c in node.children if c.type == "body"), None)
+        callees = list(_rf_calls(body, data)) if body is not None else []
+        # un test case appelle des keywords mais n'est pas appelable lui-même (clé None)
+        key = _rf_norm(name) if node.type == "keyword_definition" else None
+        out.append((f"{qual}.{name}", key, callees))
+    return out
+
+
+# Langages supportés par le callgraph, et l'extracteur associé.
+_CALLGRAPH_LANGS = ("go", "c_sharp", "robot")
+
+
+def _callgraph_for(lang: str, files: list[Path], root: Path, parser) -> str | None:
+    funcs: list[_Func] = []
     name_to_labels: dict[str, set[str]] = {}
-    for p in go_files:
+    for p in files:
         try:
             data = p.read_text(encoding="utf-8", errors="replace").encode("utf-8")
         except OSError:
             continue
-        qual = p.parent.name or root.resolve().name  # ≈ package (dossier Go)
         tree = parser.parse(data).root_node
-        for node in _descend(tree, {"function_declaration", "method_declaration"}):
-            rest, simple = _go_func_label(node, data)
-            label = f"{qual}.{rest}"
-            body = node.child_by_field_name("body")
-            funcs.append((label, simple, body, data))
-            name_to_labels.setdefault(simple, set()).add(label)
+        if lang == "go":
+            items = _extract_go(tree, data, p.parent.name or root.resolve().name)
+        elif lang == "c_sharp":
+            items = _extract_cs(tree, data)
+        else:  # robot
+            items = _extract_rf(tree, data, p.stem)
+        for label, key, callees in items:
+            funcs.append((label, key, callees))
+            if key is not None:
+                name_to_labels.setdefault(key, set()).add(label)
 
     declared = set(name_to_labels)
     forward: list[tuple[str, list[str]]] = []
     reverse: dict[str, list[str]] = {}
-    for label, simple, body, data in funcs:
-        if body is None:
-            continue
-        callees: list[str] = []
+    for label, key, callees in funcs:
+        resolved: list[str] = []
         seen: set[str] = set()
-        for name in _go_callees(body, data):
-            if name in declared and name not in seen and name != simple:
-                seen.add(name)
-                labels = name_to_labels[name]
-                callee = next(iter(labels)) if len(labels) == 1 else name
-                callees.append(callee)
-        if callees:
-            forward.append((label, callees))
-            for c in callees:
-                callers = reverse.setdefault(c, [])
+        for c in callees:
+            if c in declared and c not in seen and c != key:
+                seen.add(c)
+                labels = name_to_labels[c]
+                resolved.append(next(iter(labels)) if len(labels) == 1 else c)
+        if resolved:
+            forward.append((label, resolved))
+            for r in resolved:
+                callers = reverse.setdefault(r, [])
                 if label not in callers:
                     callers.append(label)
 
+    if not forward:
+        return None
     lines = ["# appelant -> appelés"]
     lines += [f"{label} -> {', '.join(cs)}" for label, cs in forward]
     lines.append("# appelés <- appelants (analyse d'impact)")
     lines += [f"{callee} <- {', '.join(reverse[callee])}" for callee in sorted(reverse)]
     return "\n".join(lines)
+
+
+def build_callgraph(files: list[Path], root: Path) -> list[tuple[str, str]] | None:
+    """Graphes d'appel intra-projet (Go, C#, Robot) : sens direct + index inversé.
+
+    Renvoie une liste (langage, texte) — une section par langage présent — ou None.
+    Heuristique syntaxique : appelés appariés par nom simple (normalisé en Robot) ;
+    labels qualifiés par dossier (Go), classe (C#) ou fichier (Robot). Un appelé dont
+    le nom reste ambigu (plusieurs déclarations) est laissé en nom simple.
+    """
+    sections: list[tuple[str, str]] = []
+    for lang in _CALLGRAPH_LANGS:
+        lang_files = [p for p in files if EXT_LANG.get(p.suffix.lower()) == lang]
+        if not lang_files:
+            continue
+        parser = _get_parser(lang)
+        if parser is None:
+            continue
+        graph = _callgraph_for(lang, lang_files, root, parser)
+        if graph:
+            sections.append((lang, graph))
+    return sections or None
 
 
 # --------------------------------------------------------------------------- #
@@ -475,9 +583,8 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
         out += [f'<file path="{rel}">', render_file(p, opts), "</file>"]
     out.append("</files>")
     if opts.callgraph:
-        graph = build_callgraph(files, root)
-        if graph:
-            out += ['<call_graph lang="go">', graph, "</call_graph>"]
+        for lang, graph in build_callgraph(files, root) or []:
+            out += [f'<call_graph lang="{lang}">', graph, "</call_graph>"]
     return "\n".join(out) + "\n"
 
 
@@ -653,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
                          "Repli sur le contenu intégral si tree-sitter absent.")
     ap.add_argument("--callgraph", action="store_true",
                     help="Ajoute une section <call_graph> appelant→appelés + index "
-                         "inversé (Go, prototype).")
+                         "inversé (Go, C#, Robot).")
     ap.add_argument("--architecture", action="store_true",
                     help="Raccourci: --signatures + --callgraph.")
     ap.add_argument("--setup", action="store_true",
@@ -700,6 +807,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "
               f"Active-le une fois avec : python {Path(__file__).name} --setup",
               file=sys.stderr)
+    elif args.callgraph and "<call_graph" not in output:
+        print("ℹ callgraph : généré uniquement pour Go, C# et Robot "
+              "(aucun fichier concerné ici).", file=sys.stderr)
     tokens, method = estimate_tokens(output)
 
     if args.stdout:

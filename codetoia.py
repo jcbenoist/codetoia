@@ -9,8 +9,9 @@ Usage :
     python codetoia.py .              # tout le dépôt → presse-papier (+ résumé tokens)
     python codetoia.py . -o dump.xml  # → fichier
     python codetoia.py . --compress   # retire commentaires + lignes vides (gain max)
-    python codetoia.py . --architecture # Go/C#/C/C++/JS/TS/Robot : signatures seules
-    python codetoia.py --setup        # installe (1 fois) les libs de --architecture
+    python codetoia.py . --signatures   # Go/CS/C/C++/JS/TS/RF : signatures seules
+    python codetoia.py . --architecture # = --signatures + --callgraph (Go)
+    python codetoia.py --setup        # installe (1 fois) les libs tree-sitter/tiktoken
 """
 from __future__ import annotations
 
@@ -174,7 +175,7 @@ def transform(text: str, ext: str, opts: argparse.Namespace) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Mode architecture (Tree-sitter) : ne garder que les signatures
+# Mode signatures (Tree-sitter) : ne garder que les signatures
 # --------------------------------------------------------------------------- #
 
 EXT_LANG = {
@@ -307,7 +308,7 @@ def _collect_bodies(node, lang: str, edits: list) -> None:
         _collect_bodies(child, lang, edits)
 
 
-def to_architecture(source: str, lang: str) -> str | None:
+def to_signatures(source: str, lang: str) -> str | None:
     """Garde signatures + types, remplace les corps de fonctions par `{ ... }`.
 
     None si Tree-sitter ou la grammaire est indisponible (→ repli appelant).
@@ -327,6 +328,105 @@ def to_architecture(source: str, lang: str) -> str | None:
         pos = end
     out += data[pos:]
     return out.decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------- #
+# Arbre d'appel intra-projet (prototype : Go)
+# --------------------------------------------------------------------------- #
+
+def _txt(node, data: bytes) -> str:
+    return data[node.start_byte:node.end_byte].decode("utf-8", "replace")
+
+
+def _descend(node, types: set[str]):
+    """Itère récursivement les nœuds des types donnés."""
+    if node.type in types:
+        yield node
+    for child in node.children:
+        yield from _descend(child, types)
+
+
+def _go_func_label(node, data: bytes) -> tuple[str, str]:
+    """(label affiché, nom simple) pour une fonction/méthode Go."""
+    name = node.child_by_field_name("name")
+    simple = _txt(name, data) if name else "?"
+    recv = node.child_by_field_name("receiver")  # méthode : (e *Engine)
+    if recv is not None:
+        tid = next(_descend(recv, {"type_identifier"}), None)
+        if tid is not None:
+            return f"{_txt(tid, data)}.{simple}", simple
+    return simple, simple
+
+
+def _go_callees(body, data: bytes):
+    """Noms (simples) des fonctions appelées dans un corps Go."""
+    for call in _descend(body, {"call_expression"}):
+        fn = call.child_by_field_name("function")
+        if fn is None:
+            continue
+        if fn.type == "identifier":            # foo(...)
+            yield _txt(fn, data)
+        elif fn.type == "selector_expression":  # e.Close(...), pkg.Query(...)
+            field = fn.child_by_field_name("field")
+            if field is not None:
+                yield _txt(field, data)
+
+
+def build_callgraph(files: list[Path], root: Path) -> str | None:
+    """Graphe d'appel intra-projet (Go) : sens direct + index inversé.
+
+    None si tree-sitter-go est indisponible ou s'il n'y a aucun fichier Go.
+    Heuristique syntaxique : appelés appariés par nom simple ; les labels sont
+    qualifiés par le dossier (≈ package Go) pour lever les homonymes inter-packages.
+    Un appelé dont le nom reste ambigu (plusieurs déclarations) est laissé en nom simple.
+    """
+    parser = _get_parser("go")
+    go_files = [p for p in files if p.suffix.lower() == ".go"]
+    if parser is None or not go_files:
+        return None
+
+    funcs: list[tuple[str, str, object, bytes]] = []  # (label, simple, body, data)
+    name_to_labels: dict[str, set[str]] = {}
+    for p in go_files:
+        try:
+            data = p.read_text(encoding="utf-8", errors="replace").encode("utf-8")
+        except OSError:
+            continue
+        qual = p.parent.name or root.resolve().name  # ≈ package (dossier Go)
+        tree = parser.parse(data).root_node
+        for node in _descend(tree, {"function_declaration", "method_declaration"}):
+            rest, simple = _go_func_label(node, data)
+            label = f"{qual}.{rest}"
+            body = node.child_by_field_name("body")
+            funcs.append((label, simple, body, data))
+            name_to_labels.setdefault(simple, set()).add(label)
+
+    declared = set(name_to_labels)
+    forward: list[tuple[str, list[str]]] = []
+    reverse: dict[str, list[str]] = {}
+    for label, simple, body, data in funcs:
+        if body is None:
+            continue
+        callees: list[str] = []
+        seen: set[str] = set()
+        for name in _go_callees(body, data):
+            if name in declared and name not in seen and name != simple:
+                seen.add(name)
+                labels = name_to_labels[name]
+                callee = next(iter(labels)) if len(labels) == 1 else name
+                callees.append(callee)
+        if callees:
+            forward.append((label, callees))
+            for c in callees:
+                callers = reverse.setdefault(c, [])
+                if label not in callers:
+                    callers.append(label)
+
+    lines = ["# appelant -> appelés"]
+    lines += [f"{label} -> {', '.join(cs)}" for label, cs in forward]
+    lines.append("# appelés <- appelants (analyse d'impact)")
+    lines += [f"{callee} <- {', '.join(reverse[callee])}" for callee in sorted(reverse)]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -374,6 +474,10 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
         rel = str(p.relative_to(root)).replace(os.sep, "/")
         out += [f'<file path="{rel}">', render_file(p, opts), "</file>"]
     out.append("</files>")
+    if opts.callgraph:
+        graph = build_callgraph(files, root)
+        if graph:
+            out += ['<call_graph lang="go">', graph, "</call_graph>"]
     return "\n".join(out) + "\n"
 
 
@@ -383,10 +487,10 @@ def render_file(p: Path, opts: argparse.Namespace) -> str:
     except OSError as e:
         return f"<illisible: {e}>"
     ext = p.suffix.lower()
-    if opts.architecture and ext in EXT_LANG:
-        arch = to_architecture(source, EXT_LANG[ext])
-        if arch is not None:
-            source = arch  # sinon : repli silencieux sur le contenu intégral
+    if opts.signatures and ext in EXT_LANG:
+        sig = to_signatures(source, EXT_LANG[ext])
+        if sig is not None:
+            source = sig  # sinon : repli silencieux sur le contenu intégral
     return transform(source, ext, opts)
 
 
@@ -416,7 +520,7 @@ def to_clipboard(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Bootstrap : .venv local pour activer --architecture sans gérer de venv soi-même
+# Bootstrap : .venv local pour activer --signatures/--callgraph sans gérer de venv
 # --------------------------------------------------------------------------- #
 
 def _venv_dir() -> Path:
@@ -465,9 +569,52 @@ def do_setup() -> int:
     if r.returncode != 0:
         print("✗ Installation échouée (vérifie la connexion internet).", file=sys.stderr)
         return 1
-    print("✓ Setup terminé — `--architecture` et le comptage tiktoken sont actifs.",
+    print("✓ Setup terminé — `--signatures`/`--callgraph` et tiktoken sont actifs.",
           file=sys.stderr)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Filtrage par langage (--lang, exclusif de --include)
+# --------------------------------------------------------------------------- #
+
+# Langage → extensions. Noms canoniques = abréviations (mêmes langages que --signatures).
+LANG_EXTS = {
+    "go":  [".go"],
+    "cs":  [".cs"],
+    "c":   [".c", ".h"],
+    "c++": [".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h"],
+    "js":  [".js", ".jsx", ".mjs", ".cjs"],
+    "ts":  [".ts", ".mts", ".cts", ".tsx"],
+    "rf":  [".robot", ".resource"],
+}
+# Noms longs tolérés en entrée → abréviation canonique.
+LANG_ALIASES = {
+    "golang": "go", "c#": "cs", "csharp": "cs",
+    "cpp": "c++", "cxx": "c++", "cc": "c++",
+    "javascript": "js", "node": "js", "typescript": "ts",
+    "robot": "rf", "robotframework": "rf",
+}
+
+
+def _resolve_langs(spec: str) -> list[str] | None:
+    """Convertit 'go,cs' en liste d'extensions. None (+ message) si langage inconnu."""
+    exts: list[str] = []
+    unknown: list[str] = []
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        name = LANG_ALIASES.get(name, name)
+        if name in LANG_EXTS:
+            exts += LANG_EXTS[name]
+        else:
+            unknown.append(raw.strip())
+    if unknown:
+        print(f"Erreur: langage(s) inconnu(s) : {', '.join(unknown)}.\n"
+              f"Abréviations valides : {', '.join(LANG_EXTS)}.", file=sys.stderr)
+        return None
+    return exts
 
 
 # --------------------------------------------------------------------------- #
@@ -488,21 +635,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stdout", action="store_true", help="Écrit le dump sur stdout")
     ap.add_argument("-c", "--clipboard", action="store_true",
                     help="Force la copie vers le presse-papier")
-    ap.add_argument("--include", metavar="EXT", help="Extensions à inclure (ex: py,ts,md)")
+    sel = ap.add_mutually_exclusive_group()
+    sel.add_argument("--include", metavar="EXT", help="Extensions à inclure (ex: py,ts,md)")
+    sel.add_argument("--lang", metavar="LANG",
+                     help="N'inclure que les fichiers d'un/des langage(s). "
+                          "Abréviations : Go, CS, C, C++, JS, TS, RF (ex: go,cs). "
+                          "Exclusif avec --include.")
     ap.add_argument("--exclude", metavar="GLOB", default="",
                     help="Motifs glob à exclure, séparés par des virgules")
     ap.add_argument("--strip-comments", action="store_true", help="Retire les commentaires")
     ap.add_argument("--strip-blank", action="store_true", help="Retire toutes les lignes vides")
     ap.add_argument("--compress", action="store_true",
                     help="Raccourci: --strip-comments --strip-blank")
-    ap.add_argument("--architecture", action="store_true",
-                    help="Go, C#, C, C++, JS, TS, Robot: ne garder que les signatures "
+    ap.add_argument("--signatures", action="store_true",
+                    help="Go, CS, C, C++, JS, TS, RF: ne garder que les signatures "
                          "(corps → { ... } / étapes → ...). "
                          "Repli sur le contenu intégral si tree-sitter absent.")
+    ap.add_argument("--callgraph", action="store_true",
+                    help="Ajoute une section <call_graph> appelant→appelés + index "
+                         "inversé (Go, prototype).")
+    ap.add_argument("--architecture", action="store_true",
+                    help="Raccourci: --signatures + --callgraph.")
     ap.add_argument("--setup", action="store_true",
                     help="Installe (une fois, internet requis) tree-sitter & tiktoken "
-                         "dans un .venv local pour activer --architecture. Ensuite le "
-                         "script s'en sert automatiquement.")
+                         "dans un .venv local pour activer --signatures/--callgraph. "
+                         "Ensuite le script s'en sert automatiquement.")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
@@ -511,9 +668,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.setup:
         return do_setup()
+    if args.architecture:  # raccourci = signatures + graphe d'appel
+        args.signatures = args.callgraph = True
     if args.compress:
         args.strip_comments = args.strip_blank = True
-    args.include = [e.strip() for e in args.include.split(",")] if args.include else None
+    if args.lang:  # exclusif de --include (garanti par argparse)
+        args.include = _resolve_langs(args.lang)
+        if args.include is None:
+            return 2
+    else:
+        args.include = ([e.strip() for e in args.include.split(",")]
+                        if args.include else None)
     args.exclude = [e.strip() for e in args.exclude.split(",") if e.strip()]
 
     root = Path(args.path)
@@ -530,9 +695,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     output = build_xml(root, files, args)
-    if args.architecture and _missing_langs:
+    if (args.signatures or args.callgraph) and _missing_langs:
         miss = ", ".join(sorted(_missing_langs))
-        print(f"⚠ Mode architecture indisponible pour {miss} (contenu intégral conservé). "
+        print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "
               f"Active-le une fois avec : python {Path(__file__).name} --setup",
               file=sys.stderr)
     tokens, method = estimate_tokens(output)

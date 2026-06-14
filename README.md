@@ -12,16 +12,20 @@ python3 codetoia.py . -o dump.xml      # → fichier nommé explicitement
 python3 codetoia.py . --stdout         # → sortie standard
 python3 codetoia.py . -c               # → fichier + copie presse-papier
 python3 codetoia.py . --compress       # gain max : retire commentaires + lignes vides
-python3 codetoia.py . --signatures     # signatures seules (Go/CS/C/C++/JS/TS/RF)
-python3 codetoia.py . --callgraph      # ajoute le graphe d'appel (Go, C#, C, C++, JS, TS, Robot)
-python3 codetoia.py . --architecture   # = --signatures + --callgraph
+python3 codetoia.py . --signatures     # ⚙ signatures seules (Go/CS/C/C++/JS/TS/RF)
+python3 codetoia.py . --callgraph      # ⚙ ajoute le graphe d'appel (Go, C#, C, C++, JS, TS, Robot)
+python3 codetoia.py . --architecture   # ⚙ = --signatures + --callgraph
+python3 codetoia.py --setup            # installe les libs des options ⚙ (1 fois/machine)
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C/C++/JS/TS/RF
 python3 codetoia.py . --no-prompt       # sans le prompt d'instruction (actif par défaut)
 python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
 
-Le répertoire doit être un dépôt git (sinon erreur).
+Le répertoire doit être un dépôt git (sinon erreur). Les options marquées **⚙**
+(`--signatures`, `--callgraph`, `--architecture`) nécessitent `--setup` une fois par
+machine ; sans, elles se replient sur le contenu intégral. Tout le reste tourne en
+Python standard.
 
 **Sortie par défaut** : un fichier écrit dans le répertoire courant, nommé
 `<repo>-<options>-dump.xml` où les options actives sont rappelées (ex.
@@ -89,9 +93,9 @@ chaque exécution.
 | `-o, --output` | nom de fichier explicite (sinon `<repo>-<options>-dump.xml`) |
 | `--stdout` | écrit sur la sortie standard |
 | `-c, --clipboard` | copie *aussi* dans le presse-papier (en plus du fichier) |
-| `--signatures` | Go/CS/C/C++/JS/TS/RF : ne garder que les signatures (corps → `{ ... }`) |
-| `--callgraph` | ajoute `<call_graph>` (Go, C#, C, C++, JS, TS, Robot) : appelant→appelés + index inversé appelés←appelants (analyse d'impact) ; une section par langage |
-| `--architecture` | raccourci : `--signatures` + `--callgraph` |
+| `--signatures` ⚙ | Go/CS/C/C++/JS/TS/RF : ne garder que les signatures (corps → `{ ... }`) |
+| `--callgraph` ⚙ | ajoute `<call_graph>` (Go, C#, C, C++, JS, TS, Robot) : appelant→appelés + index inversé appelés←appelants (analyse d'impact) ; une section par langage |
+| `--architecture` ⚙ | raccourci : `--signatures` + `--callgraph` |
 | `--compress` | `--strip-comments` + `--strip-blank` |
 | `--strip-comments` / `--strip-blank` | au choix |
 | `--include EXT,…` | liste blanche d'extensions |
@@ -103,6 +107,13 @@ chaque exécution.
 | `--no-tree` | sans arborescence |
 | `--max-size KB` | saute les fichiers volumineux (défaut 512) |
 | `--keep-empty` | garde les fichiers vides |
+
+> **⚙ = nécessite `--setup`** (libs natives `tree-sitter`). Sans, ces options
+> s'exécutent quand même mais **se replient sur le contenu intégral** (avec un
+> avertissement). Le **comptage exact des tokens** (`tiktoken`) en dépend aussi —
+> sinon estimation `chars/4`. Toutes les **autres** options (filtrage, `--compress`,
+> `--mask-secrets`, `--dedup-comments`, `--prompt`, presse-papier…) fonctionnent en
+> **Python standard, sans `--setup`**. Voir [Installation](#modes-signatures--callgraph--installation).
 
 Un bloc **`<prompt>`** d'instruction est **préfixé par défaut** : il cadre le modèle en
 **ingénieur logiciel**, lui annonce que des questions précises sur le code vont suivre,

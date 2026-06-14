@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                          "Repli sur le contenu intégral si tree-sitter absent.")
     ap.add_argument("--callgraph", action="store_true",
                     help="Ajoute une section <call_graph> appelant→appelés + index "
-                         "inversé (Go, C#, Robot).")
+                         "inversé (Go, C#, C, C++, JS, TS, Robot).")
     ap.add_argument("--architecture", action="store_true",
                     help="Raccourci: --signatures + --callgraph.")
     ap.add_argument("--setup", action="store_true",

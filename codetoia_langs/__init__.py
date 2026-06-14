@@ -45,8 +45,11 @@ for _l in LANGS:
         if _l.block_comment:
             _BLOCK[_e] = _l.block_comment
 
-# Langages avec graphe d'appel implémenté (pour le message d'aide).
-CALLGRAPH_NAMES = [_l.name for _l in LANGS if _l.extract_calls is not None]
+# Groupes de callgraph (ts+tsx fusionnés), dans l'ordre des LANGS.
+CALLGRAPH_NAMES: list[str] = []
+for _l in LANGS:
+    if _l.extract_calls is not None and _l.callgraph_group not in CALLGRAPH_NAMES:
+        CALLGRAPH_NAMES.append(_l.callgraph_group)
 
 
 def comment_markers(ext: str):
@@ -97,27 +100,33 @@ def signatures(source: str, ext: str):
 
 
 def build_callgraph(files, root):
-    """Graphes d'appel par langage. Liste (nom_langage, texte) — une par langage — ou None."""
+    """Graphes d'appel par groupe de langage. Liste (groupe, texte) ou None.
+
+    Les fichiers sont regroupés par `callgraph_group` (ts+tsx fusionnés) et chacun
+    est parsé avec sa propre grammaire ; une section <call_graph> par groupe.
+    """
+    groups: dict[str, list] = {}
+    for p in files:
+        lang = BY_EXT.get(p.suffix.lower())
+        if lang is None or lang.extract_calls is None:
+            continue
+        groups.setdefault(lang.callgraph_group, []).append((p, lang))
     sections = []
-    for lang in LANGS:
-        if lang.extract_calls is None:
-            continue
-        lang_files = [p for p in files if BY_EXT.get(p.suffix.lower()) is lang]
-        if not lang_files:
-            continue
-        parser = get_parser(lang)
-        if parser is None:
-            continue
-        graph = _graph_for(lang, lang_files, root, parser)
-        if graph:
-            sections.append((lang.name, graph))
+    for group in CALLGRAPH_NAMES:           # ordre stable (ordre des LANGS)
+        if group in groups:
+            graph = _graph_for(groups[group], root)
+            if graph:
+                sections.append((group, graph))
     return sections or None
 
 
-def _graph_for(lang: Lang, files, root, parser):
+def _graph_for(items, root):
     funcs = []
     name_to_labels: dict[str, set] = {}
-    for p in files:
+    for p, lang in items:
+        parser = get_parser(lang)
+        if parser is None:
+            continue
         try:
             data = p.read_text(encoding="utf-8", errors="replace").encode("utf-8")
         except OSError:

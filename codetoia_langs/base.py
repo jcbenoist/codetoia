@@ -30,8 +30,13 @@ class Lang:
     body_containers: frozenset = frozenset()     # signatures : nœuds dont le corps → { ... }
     collect_bodies: Optional[Callable] = None    # override signatures (Robot) ; sinon body_containers
     extract_calls: Optional[Callable] = None     # callgraph (tree, data, file, root) -> list[Func]
+    cg_group: Optional[str] = None               # langages fusionnés en un graphe (ts+tsx) ; déf. = name
     line_comment: Optional[str] = None
     block_comment: Optional[tuple[str, str]] = None
+
+    @property
+    def callgraph_group(self) -> str:
+        return self.cg_group or self.name
 
 
 # --- helpers tree-sitter (API stable : node.type / children / child_by_field_name) ---

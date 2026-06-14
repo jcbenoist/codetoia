@@ -85,6 +85,7 @@ chaque exécution.
 | `--lang LANG,…` | n'inclure qu'un/des langage(s) — `Go CS C C++ JS TS RF` ; exclusif de `--include` |
 | `--exclude GLOB,…` | motifs à exclure |
 | `--no-mask-secrets` | désactive le masquage des secrets (**actif par défaut**) |
+| `--no-dedup-comments` | désactive la factorisation des commentaires répétés (**active par défaut**) |
 | `--no-tree` | sans arborescence |
 | `--max-size KB` | saute les fichiers volumineux (défaut 512) |
 | `--keep-empty` | garde les fichiers vides |
@@ -97,6 +98,20 @@ reste lisible. Un récap s'affiche sur stderr quand quelque chose est masqué ;
 `--no-mask-secrets` désactive complètement la passe. C'est une heuristique haute
 confiance, pas exhaustive : un complément de prudence, pas un substitut à une vraie
 gestion de secrets.
+
+La **factorisation des commentaires répétés** est **active par défaut** : les **blocs
+répétés** (typiquement les en-têtes de licence/copyright en tête de chaque fichier —
+100 fichiers Apache‑2.0 = 100 fois le même bloc) sont émis **une seule fois** dans
+`<common_comments>` et chaque fichier les référence par `[common-N]`.
+
+La détection est **fine** (ligne à ligne, via *ancre + extension par unanimité*) :
+elle factorise le plus grand fragment commun même quand l'en-tête **varie
+partiellement** d'un fichier à l'autre (ex. le pavé GPL identique est extrait alors que
+la ligne de description ou de copyright, propre à chaque fichier, reste en place). Les
+délimiteurs `/* */` sont préservés. C'est **agnostique au langage** (marqueurs du
+registre) et matche même un en-tête identique écrit en `//` et en `#`. Un **garde-fou
+« gain net »** ne factorise que si ça économise réellement — jamais d'augmentation.
+Sans objet (ignoré) avec `--compress`. `--no-dedup-comments` pour désactiver.
 
 Le **callgraph** est une heuristique *syntaxique* (tree-sitter) limitée aux appels
 **intra-projet** : les appels stdlib/bibliothèques sont écartés. Les appelants sont

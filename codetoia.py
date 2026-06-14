@@ -163,6 +163,143 @@ def transform(text: str, ext: str, opts: argparse.Namespace) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Factorisation des commentaires redondants (--dedup-comments)
+# --------------------------------------------------------------------------- #
+
+_DEDUP_MIN_LEN = 60      # « substance » minimale d'un fragment (somme des lignes normalisées)
+_DEDUP_MIN_FILES = 2     # redondant = au moins N occurrences (fichiers ou répétitions)
+
+
+def _norm_line(line: str, lc: str | None, block) -> str:
+    """Texte d'une ligne de commentaire, sans marqueurs ni marge « * »."""
+    s = line.strip()
+    if block:
+        s = s.replace(block[0], "").replace(block[1], "")
+    if lc and s.startswith(lc):
+        s = s[len(lc):]
+    return s.strip().lstrip("*").strip()
+
+
+def _comment_line_map(text: str, lc: str | None, block):
+    """(lignes, info) où info[i]=(normalisé, style) si la ligne i est un commentaire
+    factorisable, sinon None. Les délimiteurs `/*` et `*/` sont exclus (préservés)."""
+    lines = text.split("\n")
+    n, i = len(lines), 0
+    info: list = [None] * n
+    while i < n:
+        s = lines[i].strip()
+        if lc and s.startswith(lc):                       # run de commentaires ligne
+            j = i
+            while j < n and lines[j].strip().startswith(lc):
+                info[j] = (_norm_line(lines[j], lc, None), "line")
+                j += 1
+            i = j
+        elif block and s.startswith(block[0]):            # bloc /* ... */
+            j = i
+            while j < n and block[1] not in lines[j]:
+                j += 1
+            end = min(j + 1, n)
+            for k in range(i + 1, end - 1):               # intérieur seulement
+                info[k] = (_norm_line(lines[k], None, block), "block")
+            i = end
+        else:
+            i += 1
+    return lines, info
+
+
+_DEDUP_SEED_MIN = 12     # longueur mini d'une ligne « ancre » distinctive
+
+
+def scan_comment_blocks(files: list[Path]):
+    """Analyse globale → (blocs communs [(id, brut)], plan {fichier: [(début,fin,réf)]}).
+
+    Ancre + extension par unanimité : une ligne distinctive partagée sert d'ancre, et
+    on étend à gauche/droite tant que TOUTES ses occurrences ont la même ligne — ce qui
+    capture le plus grand bloc commun (ex. pavé de licence) en s'arrêtant pile sur les
+    lignes qui varient (description, copyright propre au fichier). Les plus longs blocs
+    sont traités en premier ; les lignes déjà prises ne sont pas réutilisées.
+    """
+    flines: dict = {}   # path -> lignes
+    finfo: dict = {}    # path -> info[i] = (normalisé, style) | None
+    flc: dict = {}      # path -> marqueur ligne
+    occ: dict = {}      # normalisé -> [(path, idx)]
+    nfiles: dict = {}   # normalisé -> set(path)
+    for p in files:
+        lc, block = langs.comment_markers(p.suffix.lower())
+        if not lc and not block:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines, info = _comment_line_map(text, lc, block)
+        sp = str(p)
+        flines[sp], finfo[sp], flc[sp] = lines, info, lc
+        for i, it in enumerate(info):
+            if it is not None:
+                occ.setdefault(it[0], []).append((sp, i))
+                nfiles.setdefault(it[0], set()).add(sp)
+
+    covered: set = set()  # (path, idx) déjà factorisés
+
+    def line_at(f, k):
+        if k < 0 or k >= len(finfo[f]) or finfo[f][k] is None or (f, k) in covered:
+            return None
+        return finfo[f][k][0]
+
+    common: list = []
+    plan: dict = {}
+    seeds = sorted((s for s, fs in nfiles.items()
+                    if len(fs) >= _DEDUP_MIN_FILES and len(s) >= _DEDUP_SEED_MIN),
+                   key=len, reverse=True)
+    for seed in seeds:
+        occs = [(f, i) for (f, i) in occ[seed] if (f, i) not in covered]
+        if len({f for f, _ in occs}) < _DEDUP_MIN_FILES:
+            continue
+        f0, i0 = occs[0]
+        lo = hi = 0
+        while True:                                   # étend à gauche
+            v = line_at(f0, i0 + lo - 1)
+            if v is None or any(line_at(f, i + lo - 1) != v for f, i in occs):
+                break
+            lo -= 1
+        while True:                                   # étend à droite
+            v = line_at(f0, i0 + hi + 1)
+            if v is None or any(line_at(f, i + hi + 1) != v for f, i in occs):
+                break
+            hi += 1
+        seq = [finfo[f0][i0 + d][0] for d in range(lo, hi + 1)]
+        if sum(len(s) for s in seq) < _DEDUP_MIN_LEN:
+            continue
+        raw0 = "\n".join(flines[f0][i0 + lo: i0 + hi + 1])
+        total = sum(len("\n".join(flines[f][i + lo: i + hi + 1])) for f, i in occs)
+        if total - (len(raw0) + 14 + 16 * len(occs)) <= 0:   # garde-fou gain net
+            continue
+        cid = len(common) + 1
+        common.append((cid, raw0))
+        for f, i in occs:
+            start, end = i + lo, i + hi + 1
+            ln0 = flines[f][start]
+            indent = ln0[:len(ln0) - len(ln0.lstrip())]
+            prefix = indent + ("* " if finfo[f][start][1] == "block" else f"{flc[f]} ")
+            plan.setdefault(f, []).append((start, end, f"{prefix}[common-{cid}]"))
+            covered.update((f, k) for k in range(start, end))
+    return common, plan
+
+
+def factor_comments(text: str, plan_list: list) -> str:
+    """Applique le plan de remplacement (du bas vers le haut pour garder les index)."""
+    lines = text.split("\n")
+    for start, end, ref in sorted(plan_list, key=lambda x: x[0], reverse=True):
+        lines[start:end] = [ref]
+    return "\n".join(lines)
+
+
+def render_common(common: list) -> str:
+    return "\n\n".join(f"[common-{cid}]\n{raw}" for cid, raw in common)
+
+
+# --------------------------------------------------------------------------- #
 # Masquage de secrets (--mask-secrets) : détection regex haute confiance
 # --------------------------------------------------------------------------- #
 
@@ -229,12 +366,15 @@ def render_tree(root: Path, files: list[Path]) -> str:
     return "\n".join(lines)
 
 
-def render_file(p: Path, rel: str, opts: argparse.Namespace) -> str:
+def render_file(p: Path, rel: str, opts: argparse.Namespace, plan: dict) -> str:
     try:
         source = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"<illisible: {e}>"
     ext = p.suffix.lower()
+    pl = plan.get(str(p))
+    if pl:
+        source = factor_comments(source, pl)  # commentaires redondants → [common-N]
     if opts.mask_secrets:
         source = mask_secrets(source, rel)  # avant tout traitement
     if opts.signatures:
@@ -244,7 +384,8 @@ def render_file(p: Path, rel: str, opts: argparse.Namespace) -> str:
     return transform(source, ext, opts)
 
 
-def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
+def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
+              common: list, plan: dict) -> str:
     """Sortie XML : balises explicites pour maximiser l'attention du LLM.
 
     Le contenu n'est PAS échappé (pas de &lt;/&gt;/&amp;) : l'échappement gonflerait
@@ -260,10 +401,14 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace) -> str:
     if not opts.no_tree:
         out += ["<directory_structure>", render_tree(root, files),
                 "</directory_structure>"]
+    if common:
+        out += ["<common_comments>",
+                "# Blocs de commentaires partagés ; les fichiers y réfèrent par [common-N].",
+                render_common(common), "</common_comments>"]
     out.append("<files>")
     for p in files:
         rel = str(p.relative_to(root)).replace(os.sep, "/")
-        out += [f'<file path="{rel}">', render_file(p, rel, opts), "</file>"]
+        out += [f'<file path="{rel}">', render_file(p, rel, opts, plan), "</file>"]
     out.append("</files>")
     if opts.callgraph:
         for name, graph in langs.build_callgraph(files, root) or []:
@@ -319,6 +464,8 @@ def output_name(root: Path, args: argparse.Namespace) -> str:
         parts.append("inc-" + ",".join(args.include))
     if not args.mask_secrets:
         parts.append("nomask")
+    if not args.dedup_comments:
+        parts.append("nodedup")
     if args.no_tree:
         parts.append("notree")
     safe = [s for s in (re.sub(r"[^A-Za-z0-9]+", "-", p).strip("-") for p in parts) if s]
@@ -426,6 +573,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-mask-secrets", dest="mask_secrets", action="store_false",
                     help="Désactive le masquage des secrets (actif par défaut : clés "
                          "privées, tokens, secret=\"...\" → [redacted]).")
+    ap.add_argument("--no-dedup-comments", dest="dedup_comments", action="store_false",
+                    help="Désactive la factorisation des blocs de commentaires répétés "
+                         "(active par défaut, avec garde-fou anti-augmentation).")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
@@ -465,7 +615,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _SECRET_HITS.clear()
-    output = build_xml(root, files, args)
+    # --dedup-comments : sans objet si on retire déjà tous les commentaires
+    common, plan = (scan_comment_blocks(files)
+                    if args.dedup_comments and not args.strip_comments else ([], {}))
+    if common:
+        print(f"🧩 {len(common)} bloc(s) de commentaires factorisé(s) dans "
+              "<common_comments>", file=sys.stderr)
+    output = build_xml(root, files, args, common, plan)
     if args.mask_secrets and _SECRET_HITS:
         kinds = ", ".join(sorted({k for _, k in _SECRET_HITS}))
         nfiles = len({f for f, _ in _SECRET_HITS})

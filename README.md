@@ -2,7 +2,7 @@
 
 Regroupe les sources d'un **dépôt git** en **un seul bloc XML compact**,
 copiable/collable dans un chat IA (ChatGPT, Claude…). Objectif : minimum de tokens,
-contenu intégral.
+contenu intégral, prompt précis indiquant au LLM d'agir comme ingénieur logiciel.
 
 ## Utilisation
 
@@ -31,18 +31,19 @@ dans le presse-papier.
 
 ## Économie de tokens — comment
 
-1. **Filtrage** (principal gain) : la sélection passe par
+1. **Filtrage** : la sélection passe par
    `git ls-files --exclude-standard` (fichiers suivis + non-suivis non-ignorés),
    donc le `.gitignore`, `.git/info/exclude` et le gitignore global sont respectés
    exactement. En plus : lock files, binaires et images exclus d'office.
-2. **`--signatures`** (Go, CS, C, C++, JavaScript, TypeScript, Robot Framework) :
+2. **Détection et factorisation commentaires redondants** (entêtes copyright, standard..)
+3. **`--signatures`** (Go, CS, C, C++, JavaScript, TypeScript, Robot Framework) :
    ne garde que les signatures. Corps de fonctions remplacés par `{ ... }` (étapes
    Robot par `...`) ; types/structs/interfaces/imports/commentaires — et
    `[Arguments]`/`[Documentation]` en Robot — conservés. Vue « architecture » d'un
    gros projet à coût minimal (~40 % de tokens en moins mesuré sur un projet Go).
    **`--architecture`** = `--signatures` + `--callgraph` en une fois.
-3. **`--compress`** : suppression des commentaires (best-effort) et lignes vides.
-4. **Toujours** : espaces de fin coupés, lignes vides multiples réduites à une.
+4. **`--compress`** : suppression des commentaires (best-effort) et lignes vides.
+5. **Toujours** : espaces de fin coupés, lignes vides multiples réduites à une.
 
 L'indentation (tabulations / espaces de début de ligne) est **conservée
 volontairement** : la compresser casserait Python, YAML et les Makefile, et les
@@ -69,6 +70,17 @@ Ce n'est donc pas du XML strictement valide, mais les délimiteurs restent clair
 
 Une estimation de tokens (tiktoken si installé, sinon chars/4) est affichée à
 chaque exécution.
+
+## Prompt spécialisé intégré automatiquement
+
+```xml
+<prompt>
+<role>Tu es un ingénieur logiciel senior.</role>
+<context>Le dépôt de code complet est fourni ci-dessous. Des questions d'ingénieur précises sur ce code vont suivre.</context>
+<format_notes>Le code est dans la section « files » : une entrée par fichier, identifiée par son attribut path ; « directory_structure » donne l'arborescence. Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie que seule la signature est conservée (implémentation masquée). « call_graph » liste les appels internes au projet : « appelant -> appelés », puis l'index inverse « appelés <- appelants » (analyse d'impact). Les marqueurs « [common-N] » dans les fichiers renvoient à la section « common_comments » (blocs de commentaires partagés, factorisés). « [redacted] » remplace un secret masqué.</format_notes>
+<instructions>Analyse le code pour pouvoir y répondre avec exactitude. Cite les fichiers par leur chemin ; si une information n'y figure pas, dis-le, n'invente rien. Attends les questions.</instructions>
+</prompt>
+```
 
 ## Options
 

@@ -17,6 +17,7 @@ python3 codetoia.py . --callgraph      # ajoute le graphe d'appel (Go, C#, C, C+
 python3 codetoia.py . --architecture   # = --signatures + --callgraph
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C/C++/JS/TS/RF
+python3 codetoia.py . --no-prompt       # sans le prompt d'instruction (actif par défaut)
 python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
 
@@ -83,12 +84,19 @@ chaque exécution.
 | `--strip-comments` / `--strip-blank` | au choix |
 | `--include EXT,…` | liste blanche d'extensions |
 | `--lang LANG,…` | n'inclure qu'un/des langage(s) — `Go CS C C++ JS TS RF` ; exclusif de `--include` |
+| `--no-prompt` | n'inclut pas le `<prompt>` d'instruction (**actif par défaut**) |
 | `--exclude GLOB,…` | motifs à exclure |
 | `--no-mask-secrets` | désactive le masquage des secrets (**actif par défaut**) |
 | `--no-dedup-comments` | désactive la factorisation des commentaires répétés (**active par défaut**) |
 | `--no-tree` | sans arborescence |
 | `--max-size KB` | saute les fichiers volumineux (défaut 512) |
 | `--keep-empty` | garde les fichiers vides |
+
+Un bloc **`<prompt>`** d'instruction est **préfixé par défaut** : il cadre le modèle en
+**ingénieur logiciel**, lui annonce que des questions précises sur le code vont suivre,
+et lui donne la **légende des conventions** (adaptée aux options : `{ ... }` = signature,
+`[common-N]`, `call_graph`, `[redacted]`) plus les contraintes (citer les fichiers, ne
+rien inventer, attendre les questions). `--no-prompt` pour le retirer.
 
 Le **masquage de secrets** (équivalent léger du SecretLint) est **actif
 par défaut** : il remplace par `[redacted]` les clés privées (`-----BEGIN ... PRIVATE

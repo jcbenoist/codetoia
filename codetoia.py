@@ -384,6 +384,34 @@ def render_file(p: Path, rel: str, opts: argparse.Namespace, plan: dict) -> str:
     return transform(source, ext, opts)
 
 
+def build_prompt(opts: argparse.Namespace) -> str:
+    """Bloc <prompt> XML cadrant le LLM en ingénieur logiciel + légende des conventions."""
+    notes = ["Le code est dans la section « files » : une entrée par fichier, identifiée "
+             "par son attribut path ; « directory_structure » donne l'arborescence."]
+    if opts.signatures:
+        notes.append("Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie "
+                     "que seule la signature est conservée (implémentation masquée).")
+    if opts.callgraph:
+        notes.append("« call_graph » liste les appels internes au projet : « appelant -> "
+                     "appelés », puis l'index inverse « appelés <- appelants » (analyse d'impact).")
+    if opts.dedup_comments:
+        notes.append("Les marqueurs « [common-N] » dans les fichiers renvoient à la section "
+                     "« common_comments » (blocs de commentaires partagés, factorisés).")
+    if opts.mask_secrets:
+        notes.append("« [redacted] » remplace un secret masqué.")
+    return (
+        "<prompt>\n"
+        "<role>Tu es un ingénieur logiciel senior.</role>\n"
+        "<context>Le dépôt de code complet est fourni ci-dessous. Des questions "
+        "d'ingénieur précises sur ce code vont suivre.</context>\n"
+        "<format_notes>" + " ".join(notes) + "</format_notes>\n"
+        "<instructions>Analyse le code pour pouvoir y répondre avec exactitude. Cite les "
+        "fichiers par leur chemin ; si une information n'y figure pas, dis-le, n'invente "
+        "rien. Attends les questions.</instructions>\n"
+        "</prompt>"
+    )
+
+
 def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
               common: list, plan: dict) -> str:
     """Sortie XML : balises explicites pour maximiser l'attention du LLM.
@@ -392,7 +420,10 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
     les tokens sur le code riche en `<`/`>`/`&`. Ce n'est donc pas du XML strictement
     valide, mais les délimiteurs restent sans ambiguïté pour le modèle.
     """
-    out = [
+    out = []
+    if opts.prompt:                       # cadre le LLM en tête du dump (défaut)
+        out.append(build_prompt(opts))
+    out += [
         "<file_summary>",
         f"Projet {root.resolve().name} — {len(files)} fichiers, code source intégral. "
         'Chaque fichier est dans une balise <file path="...">…</file>.',
@@ -466,6 +497,8 @@ def output_name(root: Path, args: argparse.Namespace) -> str:
         parts.append("nomask")
     if not args.dedup_comments:
         parts.append("nodedup")
+    if not args.prompt:
+        parts.append("noprompt")
     if args.no_tree:
         parts.append("notree")
     safe = [s for s in (re.sub(r"[^A-Za-z0-9]+", "-", p).strip("-") for p in parts) if s]
@@ -576,6 +609,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-dedup-comments", dest="dedup_comments", action="store_false",
                     help="Désactive la factorisation des blocs de commentaires répétés "
                          "(active par défaut, avec garde-fou anti-augmentation).")
+    ap.add_argument("--no-prompt", dest="prompt", action="store_false",
+                    help="N'inclut pas le <prompt> d'instruction en tête (actif par "
+                         "défaut : cadre le LLM en ingénieur, légende des conventions).")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")

@@ -6,6 +6,8 @@ contenu intégral, prompt précis indiquant au LLM d'agir comme ingénieur logic
 
 ## Utilisation
 
+Quelques exemples (le répertoire doit être un dépôt git) :
+
 ```bash
 python3 codetoia.py .                  # → fichier <repo>-dump.xml dans le dossier courant
 python3 codetoia.py . -o dump.xml      # → fichier nommé explicitement
@@ -19,13 +21,77 @@ python3 codetoia.py --setup            # installe les libs des options ⚙ (1 fo
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C/C++/JS/TS/RF
 python3 codetoia.py . --no-prompt       # sans le prompt d'instruction (actif par défaut)
+python3 codetoia.py . --diff            # message de suivi : SEULEMENT les modifs non commitées
+python3 codetoia.py . --diff main-feature   # message de suivi : diff entre deux réfs (sha/tag/branche)
 python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
 
-Le répertoire doit être un dépôt git (sinon erreur). Les options marquées **⚙**
-(`--signatures`, `--callgraph`, `--architecture`) nécessitent `--setup` une fois par
-machine ; sans, elles se replient sur le contenu intégral. Tout le reste tourne en
-Python standard.
+**Référence complète des options** — bloc ci-dessous **généré depuis `--help`** (la
+source de vérité). Régénère-le après toute modif de la CLI : `python3 codetoia.py --readme`.
+
+<!-- BEGIN: codetoia --help (généré par `codetoia --readme`, ne pas éditer) -->
+```text
+usage: codetoia [-h] [-o OUTPUT] [--stdout] [-c] [--include EXT | --lang LANG]
+                [--exclude GLOB] [--diff [A-B]] [--strip-comments]
+                [--strip-blank] [--compress] [--signatures] [--callgraph]
+                [--architecture] [--setup] [--no-mask-secrets]
+                [--no-dedup-comments] [--no-prompt] [--no-tree]
+                [--max-size KB] [--keep-empty]
+                [path]
+
+Regroupe les sources d'un dépôt git en un bloc XML pour une IA.
+
+positional arguments:
+  path                 Racine du dépôt (défaut: .)
+
+options:
+  -h, --help           show this help message and exit
+  -o, --output OUTPUT  Fichier de sortie (défaut: <repo>-<options>-dump.xml
+                       dans le répertoire courant)
+  --stdout             Écrit le dump sur stdout
+  -c, --clipboard      Copie aussi vers le presse-papier (en plus du fichier)
+  --include EXT        Extensions à inclure (ex: py,ts,md)
+  --lang LANG          N'inclure que les fichiers d'un/des langage(s).
+                       Abréviations : Go, CS, C, C++, JS, TS, RF (ex: go,cs).
+                       Exclusif avec --include.
+  --exclude GLOB       Motifs glob à exclure, séparés par des virgules
+  --diff [A-B]         Message de suivi ne contenant QUE le diff (à coller
+                       après le dump complet, dans la même conversation). Sans
+                       arg : modifs non commitées. A-B : entre deux réfs
+                       sha/tag/branche (ex: main-feature, v1.0-v2.0) ; A..B
+                       accepté aussi pour lever toute ambiguïté.
+  --strip-comments     Retire les commentaires
+  --strip-blank        Retire toutes les lignes vides
+  --compress           Raccourci: --strip-comments --strip-blank
+  --signatures         Go, CS, C, C++, JS, TS, RF: ne garder que les
+                       signatures (corps → { ... } / étapes → ...). Repli sur
+                       le contenu intégral si tree-sitter absent.
+  --callgraph          Ajoute une section <call_graph> appelant→appelés +
+                       index inversé (Go, C#, C, C++, JS, TS, Robot).
+  --architecture       Raccourci: --signatures + --callgraph.
+  --setup              Installe (une fois, internet requis) tree-sitter &
+                       tiktoken dans un .venv local pour activer
+                       --signatures/--callgraph. Ensuite le script s'en sert
+                       automatiquement.
+  --no-mask-secrets    Désactive le masquage des secrets (actif par défaut :
+                       clés privées, tokens, secret="..." → [redacted]).
+  --no-dedup-comments  Désactive la factorisation des blocs de commentaires
+                       répétés (active par défaut, avec garde-fou anti-
+                       augmentation).
+  --no-prompt          N'inclut pas le <prompt> d'instruction en tête (actif
+                       par défaut : cadre le LLM en ingénieur, légende des
+                       conventions).
+  --no-tree            N'inclut pas l'arborescence
+  --max-size KB        Ignore les fichiers > KB (défaut: 512, 0 = illimité)
+  --keep-empty         Garde les fichiers vides
+```
+<!-- END: codetoia --help -->
+
+> **⚙ = nécessite `--setup`** (libs natives `tree-sitter`) : `--signatures`,
+> `--callgraph`, `--architecture`. Sans, ces options s'exécutent quand même mais
+> **se replient sur le contenu intégral** (avec un avertissement). Le **comptage exact
+> des tokens** (`tiktoken`) en dépend aussi — sinon estimation `chars/4`. Tout le reste
+> tourne en **Python standard, sans `--setup`**.
 
 **Sortie par défaut** : un fichier écrit dans le répertoire courant, nommé
 `<repo>-<options>-dump.xml` où les options actives sont rappelées (ex.
@@ -86,34 +152,28 @@ chaque exécution.
 </prompt>
 ```
 
-## Options
+## Détails de certaines options
 
-| Option | Effet |
-|--------|-------|
-| `-o, --output` | nom de fichier explicite (sinon `<repo>-<options>-dump.xml`) |
-| `--stdout` | écrit sur la sortie standard |
-| `-c, --clipboard` | copie *aussi* dans le presse-papier (en plus du fichier) |
-| `--signatures` ⚙ | Go/CS/C/C++/JS/TS/RF : ne garder que les signatures (corps → `{ ... }`) |
-| `--callgraph` ⚙ | ajoute `<call_graph>` (Go, C#, C, C++, JS, TS, Robot) : appelant→appelés + index inversé appelés←appelants (analyse d'impact) ; une section par langage |
-| `--architecture` ⚙ | raccourci : `--signatures` + `--callgraph` |
-| `--compress` | `--strip-comments` + `--strip-blank` |
-| `--strip-comments` / `--strip-blank` | au choix |
-| `--include EXT,…` | liste blanche d'extensions |
-| `--lang LANG,…` | n'inclure qu'un/des langage(s) — `Go CS C C++ JS TS RF` ; exclusif de `--include` |
-| `--no-prompt` | n'inclut pas le `<prompt>` d'instruction (**actif par défaut**) |
-| `--exclude GLOB,…` | motifs à exclure |
-| `--no-mask-secrets` | désactive le masquage des secrets (**actif par défaut**) |
-| `--no-dedup-comments` | désactive la factorisation des commentaires répétés (**active par défaut**) |
-| `--no-tree` | sans arborescence |
-| `--max-size KB` | saute les fichiers volumineux (défaut 512) |
-| `--keep-empty` | garde les fichiers vides |
+**`--diff`** produit un **message de suivi autonome** : la sortie ne contient **que**
+le `<git_diff>` (pas le code du dépôt), précédée d'un `<prompt>` recadré. Le flux visé :
 
-> **⚙ = nécessite `--setup`** (libs natives `tree-sitter`). Sans, ces options
-> s'exécutent quand même mais **se replient sur le contenu intégral** (avec un
-> avertissement). Le **comptage exact des tokens** (`tiktoken`) en dépend aussi —
-> sinon estimation `chars/4`. Toutes les **autres** options (filtrage, `--compress`,
-> `--mask-secrets`, `--dedup-comments`, `--prompt`, presse-papier…) fonctionnent en
-> **Python standard, sans `--setup`**. Voir [Installation](#modes-signatures--callgraph--installation).
+1. tu colles d'abord le **dump complet** du dépôt (sans `--diff`) dans le chat ;
+2. plus tard, dans **la même conversation**, tu colles un `--diff` pour soumettre des
+   changements — le modèle les rapporte au code déjà fourni, sans renvoyer tout le dépôt.
+
+Le diff peut être :
+- **sans argument** → modifs non commitées (`git diff HEAD`) ;
+- **`A-B`** → diff entre deux réfs, où `A` et `B` sont des **sha, tags ou branches**
+  mélangeables (ex. `main-feature`, `v1.0-v2.0`, `abc123-main`). Une branche désigne
+  son dernier commit.
+
+Le séparateur `-` est **désambiguïsé via git** : comme une branche/tag peut contenir
+des `-` (`feature/my-thing`), chaque découpe candidate est validée par
+`git rev-parse` ; si plusieurs sont valides, codetoia le signale et tu utilises la
+forme `A..B` (acceptée aussi). Le masquage de secrets s'applique au diff. Pas besoin
+de `--setup` (git pur). En mode `--diff`, le `<prompt>` est recadré en **message de
+suivi** : « le dépôt t'a déjà été fourni ; voici uniquement les changements » et oriente
+vers la revue (correction, effets de bord, impact, en s'appuyant sur le call_graph déjà transmis).
 
 Un bloc **`<prompt>`** d'instruction est **préfixé par défaut** : il cadre le modèle en
 **ingénieur logiciel**, lui annonce que des questions précises sur le code vont suivre,

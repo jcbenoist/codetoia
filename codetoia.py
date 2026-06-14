@@ -384,32 +384,122 @@ def render_file(p: Path, rel: str, opts: argparse.Namespace, plan: dict) -> str:
     return transform(source, ext, opts)
 
 
+# --------------------------------------------------------------------------- #
+# Diff git (--diff A-B) — A/B = sha/tag/branche, séparateur '-' désambiguïsé via git
+# --------------------------------------------------------------------------- #
+
+def _is_ref(root: Path, ref: str) -> bool:
+    """Vrai si `ref` résout vers un commit (branche → son dernier commit, tag, sha)."""
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        capture_output=True).returncode == 0
+
+
+def resolve_diff(root: Path, spec: str):
+    """(label_de, label_à, args git diff) ou None (+ message) si spec invalide.
+
+    spec : "" (modifs non commitées) ; "A..B"/"A...B" (syntaxe git) ; ou "A-B" où A et B
+    sont des sha/tag/branche. Le '-' est ambigu (les refs peuvent en contenir) : on
+    valide chaque découpe via git et on lève l'ambiguïté si plusieurs sont valides.
+    """
+    if spec == "":
+        return "HEAD", "(copie de travail)", ["HEAD"]
+    if ".." in spec:                                   # syntaxe git native, non ambiguë
+        sep = "..." if "..." in spec else ".."
+        a, _, b = spec.partition(sep)
+        return a or "HEAD", b or "(copie de travail)", [spec]
+    valid = [(spec[:i], spec[i + 1:]) for i, c in enumerate(spec)
+             if c == "-" and spec[:i] and spec[i + 1:]
+             and _is_ref(root, spec[:i]) and _is_ref(root, spec[i + 1:])]
+    if len(valid) == 1:
+        a, b = valid[0]
+        return a, b, [a, b]
+    if len(valid) > 1:
+        choices = ", ".join(f"{a}↔{b}" for a, b in valid)
+        print(f"Erreur: --diff '{spec}' est ambigu ({choices}). "
+              "Utilise la forme A..B pour trancher.", file=sys.stderr)
+        return None
+    if _is_ref(root, spec):                            # réf seule → réf ↔ copie de travail
+        return spec, "(copie de travail)", [spec]
+    print(f"Erreur: --diff '{spec}' : référence(s) git introuvable(s). "
+          "Attendu <ref>-<ref> (sha/tag/branche) ou A..B.", file=sys.stderr)
+    return None
+
+
+def git_diff(root: Path, spec: str):
+    """(label_de, label_à, texte du diff) ou None si spec invalide."""
+    resolved = resolve_diff(root, spec)
+    if resolved is None:
+        return None
+    frm, to, args = resolved
+    proc = subprocess.run(["git", "-C", str(root), "diff", *args], capture_output=True)
+    return frm, to, proc.stdout.decode("utf-8", "replace")
+
+
 def build_prompt(opts: argparse.Namespace) -> str:
-    """Bloc <prompt> XML cadrant le LLM en ingénieur logiciel + légende des conventions."""
-    notes = ["Le code est dans la section « files » : une entrée par fichier, identifiée "
-             "par son attribut path ; « directory_structure » donne l'arborescence."]
-    if opts.signatures:
-        notes.append("Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie "
-                     "que seule la signature est conservée (implémentation masquée).")
-    if opts.callgraph:
-        notes.append("« call_graph » liste les appels internes au projet : « appelant -> "
-                     "appelés », puis l'index inverse « appelés <- appelants » (analyse d'impact).")
-    if opts.dedup_comments:
-        notes.append("Les marqueurs « [common-N] » dans les fichiers renvoient à la section "
-                     "« common_comments » (blocs de commentaires partagés, factorisés).")
-    if opts.mask_secrets:
-        notes.append("« [redacted] » remplace un secret masqué.")
+    """Bloc <prompt> XML cadrant le LLM en ingénieur logiciel + légende des conventions.
+
+    Deux cadrages : dump complet du dépôt (défaut) ; ou message de suivi ne contenant
+    QUE le diff (`--diff`), à envoyer après le dump complet dans la même conversation.
+    """
+    if opts.diff is not None:               # message de suivi : seulement les changements
+        notes = ["« git_diff » contient un diff git unifié des changements à examiner "
+                 "(lignes « + » ajoutées, « - » retirées)."]
+        if opts.mask_secrets:
+            notes.append("« [redacted] » remplace un secret masqué.")
+        context = ("Le dépôt de code complet t'a déjà été fourni dans cette conversation. "
+                   "Ce message n'apporte QUE les changements survenus depuis : un diff git "
+                   "(section « git_diff »). Des questions d'ingénieur sur ces changements — "
+                   "revue, correction, impact — vont suivre.")
+        instructions = ("Rapporte ces changements au code déjà fourni. Évalue leur "
+                        "correction, leurs effets de bord et leur impact sur le reste du "
+                        "projet (appuie-toi sur le call_graph déjà transmis si besoin). Cite "
+                        "les fichiers par leur chemin ; si une information n'y figure pas, "
+                        "dis-le, n'invente rien. Attends les questions.")
+    else:                                   # dump complet du dépôt
+        notes = ["Le code est dans la section « files » : une entrée par fichier, identifiée "
+                 "par son attribut path ; « directory_structure » donne l'arborescence."]
+        if opts.signatures:
+            notes.append("Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie "
+                         "que seule la signature est conservée (implémentation masquée).")
+        if opts.callgraph:
+            notes.append("« call_graph » liste les appels internes au projet : « appelant -> "
+                         "appelés », puis l'index inverse « appelés <- appelants » (analyse d'impact).")
+        if opts.dedup_comments:
+            notes.append("Les marqueurs « [common-N] » dans les fichiers renvoient à la section "
+                         "« common_comments » (blocs de commentaires partagés, factorisés).")
+        if opts.mask_secrets:
+            notes.append("« [redacted] » remplace un secret masqué.")
+        context = ("Le dépôt de code complet est fourni ci-dessous. Des questions "
+                   "d'ingénieur précises sur ce code vont suivre.")
+        instructions = ("Analyse le code pour pouvoir y répondre avec exactitude. Cite les "
+                        "fichiers par leur chemin ; si une information n'y figure pas, dis-le, "
+                        "n'invente rien. Attends les questions.")
     return (
         "<prompt>\n"
         "<role>Tu es un ingénieur logiciel senior.</role>\n"
-        "<context>Le dépôt de code complet est fourni ci-dessous. Des questions "
-        "d'ingénieur précises sur ce code vont suivre.</context>\n"
+        f"<context>{context}</context>\n"
         "<format_notes>" + " ".join(notes) + "</format_notes>\n"
-        "<instructions>Analyse le code pour pouvoir y répondre avec exactitude. Cite les "
-        "fichiers par leur chemin ; si une information n'y figure pas, dis-le, n'invente "
-        "rien. Attends les questions.</instructions>\n"
+        f"<instructions>{instructions}</instructions>\n"
         "</prompt>"
     )
+
+
+def build_diff_xml(opts: argparse.Namespace, diff) -> str:
+    """Message de suivi autonome : <prompt> recadré + le seul <git_diff>.
+
+    Le dépôt complet est censé avoir été envoyé dans un premier message ; ici on
+    n'émet que les changements, à coller à la suite dans la même conversation.
+    """
+    out = []
+    if opts.prompt:
+        out.append(build_prompt(opts))
+    frm, to, text = diff
+    if opts.mask_secrets:
+        text = mask_secrets(text, "git_diff")
+    out += [f'<git_diff from="{frm}" to="{to}">',
+            text.strip() or "(aucune différence)", "</git_diff>"]
+    return "\n".join(out) + "\n"
 
 
 def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
@@ -475,6 +565,14 @@ def to_clipboard(text: str) -> bool:
 def output_name(root: Path, args: argparse.Namespace) -> str:
     """Nom de fichier par défaut : <repo>-<options>-dump.xml (options rappelées)."""
     parts = [root.resolve().name]
+    if args.diff is not None:                  # diff seul : pas d'option de contenu du dépôt
+        parts.append("diff" + (f"-{args.diff}" if args.diff else ""))
+        if not args.mask_secrets:
+            parts.append("nomask")
+        if not args.prompt:
+            parts.append("noprompt")
+        safe = [s for s in (re.sub(r"[^A-Za-z0-9]+", "-", p).strip("-") for p in parts) if s]
+        return "-".join(safe) + "-dump.xml"
     if args.architecture:
         parts.append("architecture")
     else:
@@ -562,11 +660,16 @@ def do_setup() -> int:
 # CLI
 # --------------------------------------------------------------------------- #
 
-def main(argv: list[str] | None = None) -> int:
-    raw = sys.argv[1:] if argv is None else argv
-    if "--setup" not in raw:
-        _maybe_reexec(raw)  # remplace le process si un .venv local existe
+README_HELP_BEGIN = "<!-- BEGIN: codetoia --help (généré par `codetoia --readme`, ne pas éditer) -->"
+README_HELP_END = "<!-- END: codetoia --help -->"
 
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construit l'ArgumentParser — source de vérité unique de la CLI.
+
+    Le bloc « Utilisation » du README est régénéré depuis ce parser via `--readme`
+    (voir update_readme) : le --help reste la référence, la doc ne peut pas diverger.
+    """
     ap = argparse.ArgumentParser(
         prog="codetoia",
         description="Regroupe les sources d'un dépôt git en un bloc XML pour une IA.",
@@ -586,6 +689,12 @@ def main(argv: list[str] | None = None) -> int:
                           "Exclusif avec --include.")
     ap.add_argument("--exclude", metavar="GLOB", default="",
                     help="Motifs glob à exclure, séparés par des virgules")
+    ap.add_argument("--diff", nargs="?", const="", default=None, metavar="A-B",
+                    help="Message de suivi ne contenant QUE le diff (à coller après le "
+                         "dump complet, dans la même conversation). Sans arg : modifs non "
+                         "commitées. A-B : entre deux réfs sha/tag/branche (ex: "
+                         "main-feature, v1.0-v2.0) ; A..B accepté aussi pour lever toute "
+                         "ambiguïté.")
     ap.add_argument("--strip-comments", action="store_true", help="Retire les commentaires")
     ap.add_argument("--strip-blank", action="store_true", help="Retire toutes les lignes vides")
     ap.add_argument("--compress", action="store_true",
@@ -616,8 +725,46 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
     ap.add_argument("--keep-empty", action="store_true", help="Garde les fichiers vides")
+    ap.add_argument("--readme", action="store_true", help=argparse.SUPPRESS)
+    return ap
+
+
+def update_readme(ap: argparse.ArgumentParser) -> int:
+    """Réinjecte le --help courant dans le README, entre les marqueurs (idempotent)."""
+    readme = Path(__file__).resolve().parent / "README.md"
+    os.environ["COLUMNS"] = "80"          # rendu déterministe, indépendant du terminal
+    block = (f"{README_HELP_BEGIN}\n```text\n{ap.format_help().rstrip()}\n```\n"
+             f"{README_HELP_END}")
+    try:
+        text = readme.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Erreur: lecture de {readme} impossible : {e}", file=sys.stderr)
+        return 2
+    pat = re.compile(re.escape(README_HELP_BEGIN) + r".*?" + re.escape(README_HELP_END),
+                     re.DOTALL)
+    if not pat.search(text):
+        print(f"Erreur: marqueurs absents de {readme.name} "
+              f"(attendu {README_HELP_BEGIN} … {README_HELP_END}).", file=sys.stderr)
+        return 2
+    new = pat.sub(lambda _: block, text)
+    if new == text:
+        print(f"✓ {readme.name} : section --help déjà à jour.", file=sys.stderr)
+        return 0
+    readme.write_text(new, encoding="utf-8")
+    print(f"✓ {readme.name} : section --help régénérée depuis la CLI.", file=sys.stderr)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    if not {"--setup", "--readme"} & set(raw):
+        _maybe_reexec(raw)  # remplace le process si un .venv local existe
+
+    ap = build_parser()
     args = ap.parse_args(argv)
 
+    if args.readme:
+        return update_readme(ap)
     if args.setup:
         return do_setup()
     if args.architecture:  # raccourci = signatures + graphe d'appel
@@ -642,6 +789,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Erreur: '{root}' n'est pas un répertoire.", file=sys.stderr)
         return 2
 
+    # Mode diff seul : la sortie ne contient QUE le diff (le dépôt complet a déjà été
+    # envoyé dans un premier message). On ne collecte donc pas les fichiers du dépôt.
+    if args.diff is not None:
+        if subprocess.run(["git", "-C", str(root), "rev-parse", "--git-dir"],
+                          capture_output=True).returncode != 0:
+            print(f"Erreur: '{root}' n'est pas un dépôt git.", file=sys.stderr)
+            return 2
+        diff = git_diff(root, args.diff)
+        if diff is None:
+            return 2
+        _SECRET_HITS.clear()
+        output = build_diff_xml(args, diff)
+        return _emit(args, root, output, head="✓ diff seul")
+
     files = collect(root, args)
     if files is None:
         print(f"Erreur: '{root}' n'est pas un dépôt git.", file=sys.stderr)
@@ -658,11 +819,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"🧩 {len(common)} bloc(s) de commentaires factorisé(s) dans "
               "<common_comments>", file=sys.stderr)
     output = build_xml(root, files, args, common, plan)
-    if args.mask_secrets and _SECRET_HITS:
-        kinds = ", ".join(sorted({k for _, k in _SECRET_HITS}))
-        nfiles = len({f for f, _ in _SECRET_HITS})
-        print(f"🔒 {len(_SECRET_HITS)} secret(s) masqué(s) dans {nfiles} fichier(s) "
-              f"[{kinds}]", file=sys.stderr)
     if (args.signatures or args.callgraph) and langs.MISSING:
         miss = ", ".join(sorted(langs.MISSING))
         print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "
@@ -671,13 +827,23 @@ def main(argv: list[str] | None = None) -> int:
     elif args.callgraph and "<call_graph" not in output:
         print(f"ℹ callgraph : généré uniquement pour {', '.join(langs.CALLGRAPH_NAMES)} "
               "(aucun fichier concerné ici).", file=sys.stderr)
+    return _emit(args, root, output, head=f"✓ {len(files)} fichiers")
+
+
+def _emit(args: argparse.Namespace, root: Path, output: str, head: str) -> int:
+    """Récap secrets + estimation de tokens + écriture (fichier/stdout/presse-papier)."""
+    if args.mask_secrets and _SECRET_HITS:
+        kinds = ", ".join(sorted({k for _, k in _SECRET_HITS}))
+        nfiles = len({f for f, _ in _SECRET_HITS})
+        print(f"🔒 {len(_SECRET_HITS)} secret(s) masqué(s) dans {nfiles} fichier(s) "
+              f"[{kinds}]", file=sys.stderr)
     tokens, method = estimate_tokens(output)
 
     if args.stdout:
         sys.stdout.write(output)
         return 0
 
-    summary = (f"✓ {len(files)} fichiers — {len(output):,} caractères — "
+    summary = (f"{head} — {len(output):,} caractères — "
                f"~{tokens:,} tokens ({method})").replace(",", " ")
 
     # Par défaut : fichier auto-nommé dans le répertoire courant. -o le surcharge.

@@ -23,7 +23,7 @@ python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C
 python3 codetoia.py . --no-prompt       # sans le prompt d'instruction (actif par défaut)
 python3 codetoia.py . --diff            # message de suivi : SEULEMENT les modifs non commitées
 python3 codetoia.py . --diff main-feature   # message de suivi : diff entre deux réfs (sha/tag/branche)
-python3 codetoia.py . --split           # découpe en N prompts ≤ 50000 c. (suit l'arborescence)
+python3 codetoia.py . --split           # découpe en N prompts ≤ 50000 c. (parts nommées par chemin)
 python3 codetoia.py . --split 80000     # même chose, limite par prompt à 80000 caractères
 python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
@@ -87,7 +87,9 @@ options:
                        limitée (défaut: 50000 caractères), regroupés en
                        suivant l'arborescence. Produit un message
                        d'introduction (structure + manifeste) puis N parties
-                       numérotées : <base>-part-index.xml, -part-01.xml, …
+                       nommées d'après leur chemin : <base>-part-00-index-
+                       dump.xml, -part-01-<chemin>-dump.xml, … Un fichier plus
+                       gros que la limite est isolé (non coupé).
   --no-tree            N'inclut pas l'arborescence
   --max-size KB        Ignore les fichiers > KB (défaut: 512, 0 = illimité)
   --keep-empty         Garde les fichiers vides
@@ -185,21 +187,27 @@ vers la revue (correction, effets de bord, impact, en s'appuyant sur le call_gra
 **`--split [CHARS]`** découpe un gros dépôt en **plusieurs prompts** de longueur limitée
 (défaut **50000 caractères**), à coller **dans l'ordre, dans la même conversation** :
 
-1. un **message d'introduction** (`…-part-index.xml`) : `<prompt>` global cadrant le LLM,
-   **arborescence complète**, conventions, `common_comments`/`call_graph` partagés, et un
+1. un **message d'introduction** (`…-part-00-index-dump.xml`) : `<prompt>` global cadrant le
+   LLM, **arborescence complète**, conventions, `common_comments`/`call_graph` partagés, et un
    **manifeste** « partie k → tels répertoires » ; il demande au modèle d'**attendre toutes
    les parties** avant de répondre ;
-2. puis **N parties** (`…-part-01.xml`, `-02`, …), chacune avec un court en-tête « partie
-   k/N » et ses fichiers ; la dernière annonce que le modèle peut répondre.
+2. puis **N parties** nommées d'après leur **chemin** (`…-part-01-<chemin>-dump.xml`, p. ex.
+   `-part-02-src-dump.xml`), chacune avec un court en-tête « partie k/N » et ses fichiers ; la
+   dernière annonce que le modèle peut répondre. Le numéro préserve l'ordre de collage et
+   distingue deux parties d'un même répertoire scindé. Le suffixe `-dump.xml` les fait
+   ignorer par le `.gitignore` par défaut.
 
 Le découpage **suit l'arborescence** : on évalue la taille (caractères) de chaque
 sous-répertoire ; un sous-répertoire qui tient en entier reste **groupé** (et peut
 fusionner avec ses frères) ; un sous-répertoire trop gros est **scindé en ses propres
-parties**. La limite porte sur les fichiers d'une partie (le petit en-tête s'ajoute) ; un
-fichier plus gros que la limite est **isolé** dans sa partie (signalé sur stderr). Sortie :
-des fichiers `…-part-*.xml` (ou, avec `--stdout`, tout concaténé avec des séparateurs
-`===== part k =====`). Compatible avec `--signatures`/`--compress`/`--lang`… ; `--diff`,
-lui, court-circuite le découpage (il est déjà petit).
+parties**. La limite porte sur les fichiers d'une partie (le petit en-tête s'ajoute). Un
+**fichier seul plus gros que la limite n'est pas coupé** (on ne tronçonne pas du code au
+milieu d'une fonction) : il est **isolé** dans sa partie, qui dépasse alors la limite — c'est
+signalé sur stderr. Pour les gros fichiers, `--signatures`/`--architecture` réduit les corps
+et les fait rentrer. Sortie : des fichiers `…-part-*.xml` (ou, avec `--stdout`, tout
+concaténé avec des séparateurs `===== part k =====`). Compatible avec
+`--signatures`/`--compress`/`--lang`… ; `--diff`, lui, court-circuite le découpage. La
+**taille de chaque partie** (caractères + tokens) est affichée automatiquement sur stderr.
 
 Un bloc **`<prompt>`** d'instruction est **préfixé par défaut** : il cadre le modèle en
 **ingénieur logiciel**, lui annonce que des questions précises sur le code vont suivre,

@@ -510,9 +510,10 @@ def build_diff_xml(opts: argparse.Namespace, diff) -> str:
 
 
 def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
-              common: list, plan: dict) -> str:
+              common: list, blocks) -> str:
     """Sortie XML : balises explicites pour maximiser l'attention du LLM.
 
+    `blocks` = fichiers déjà rendus (voir _file_blocks), réutilisés tels quels.
     Le contenu n'est PAS échappé (pas de &lt;/&gt;/&amp;) : l'échappement gonflerait
     les tokens sur le code riche en `<`/`>`/`&`. Ce n'est donc pas du XML strictement
     valide, mais les délimiteurs restent sans ambiguïté pour le modèle.
@@ -534,9 +535,7 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
                 "# Blocs de commentaires partagés ; les fichiers y réfèrent par [common-N].",
                 render_common(common), "</common_comments>"]
     out.append("<files>")
-    for p in files:
-        rel = str(p.relative_to(root)).replace(os.sep, "/")
-        out += [f'<file path="{rel}">', render_file(p, rel, opts, plan), "</file>"]
+    out += [block for _, block, _ in blocks]
     out.append("</files>")
     if opts.callgraph:
         for name, graph in langs.build_callgraph(files, root) or []:
@@ -624,6 +623,25 @@ def _chunk_dirs(chunk) -> list[str]:
     return sorted(dirs)
 
 
+def _chunk_slug(chunk) -> str:
+    """Slug du chemin commun des fichiers d'une partie (pour nommer le fichier de sortie)."""
+    dirs = sorted({rel.rsplit("/", 1)[0] if "/" in rel else "" for rel, _, _ in chunk})
+    if dirs == [""]:
+        label = "racine"
+    elif len(dirs) == 1:
+        label = dirs[0]
+    else:                                       # plusieurs répertoires → préfixe commun
+        comps = [d.split("/") for d in dirs if d]
+        prefix = []
+        for tup in zip(*comps):
+            if len(set(tup)) == 1:
+                prefix.append(tup[0])
+            else:
+                break
+        label = "/".join(prefix) if prefix else "divers"
+    return re.sub(r"[^A-Za-z0-9]+", "-", label).strip("-").lower() or "racine"
+
+
 def _split_index(root: Path, files: list[Path], opts: argparse.Namespace,
                  common: list, chunks) -> str:
     """Message d'introduction : prompt global, arborescence complète, manifeste des parties."""
@@ -686,14 +704,14 @@ def _split_chunk(repo: str, opts: argparse.Namespace, i: int, n: int, chunk) -> 
 
 
 def build_split(root: Path, files: list[Path], opts: argparse.Namespace,
-                common: list, plan: dict, limit: int):
+                common: list, blocks, limit: int):
     """(parties, chunks). parties = [(suffixe, contenu)] : introduction puis N parties."""
-    chunks = _pack_tree(_size_tree(_file_blocks(root, files, opts, plan)), limit)
+    chunks = _pack_tree(_size_tree(blocks), limit)
     repo = root.resolve().name
     n = len(chunks)
-    parts = [("index", _split_index(root, files, opts, common, chunks))]
+    parts = [("00-index", _split_index(root, files, opts, common, chunks))]
     for i, ch in enumerate(chunks, 1):
-        parts.append((f"{i:02d}", _split_chunk(repo, opts, i, n, ch)))
+        parts.append((f"{i:02d}-{_chunk_slug(ch)}", _split_chunk(repo, opts, i, n, ch)))
     return parts, chunks
 
 
@@ -707,6 +725,16 @@ def estimate_tokens(text: str) -> tuple[int, str]:
         return len(tiktoken.get_encoding("o200k_base").encode(text)), "tiktoken o200k"
     except Exception:
         return round(len(text) / 4), "approx (chars/4)"
+
+
+def _token_counter():
+    """(compteur(texte)->int, libellé méthode). Encodeur chargé une seule fois."""
+    try:
+        import tiktoken  # type: ignore
+        enc = tiktoken.get_encoding("o200k_base")
+        return (lambda s: len(enc.encode(s))), "tiktoken o200k"
+    except Exception:
+        return (lambda s: round(len(s) / 4)), "approx (chars/4)"
 
 
 def to_clipboard(text: str) -> bool:
@@ -887,7 +915,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Découpe le dépôt en plusieurs prompts de longueur limitée "
                          "(défaut: 50000 caractères), regroupés en suivant l'arborescence. "
                          "Produit un message d'introduction (structure + manifeste) puis N "
-                         "parties numérotées : <base>-part-index.xml, -part-01.xml, …")
+                         "parties nommées d'après leur chemin : <base>-part-00-index-dump.xml, "
+                         "-part-01-<chemin>-dump.xml, … Un fichier plus gros que la limite est "
+                         "isolé (non coupé).")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
@@ -989,12 +1019,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"🧩 {len(common)} bloc(s) de commentaires factorisé(s) dans "
               "<common_comments>", file=sys.stderr)
 
+    blocks = _file_blocks(root, files, args, plan)   # rendu unique, réutilisé partout
+
     if args.split is not None:                 # découpage en N prompts
-        parts, chunks = build_split(root, files, args, common, plan, args.split)
+        parts, chunks = build_split(root, files, args, common, blocks, args.split)
         _warn_langs(args, "".join(c for _, c in parts))
         return _emit_split(args, root, parts, chunks)
 
-    output = build_xml(root, files, args, common, plan)
+    output = build_xml(root, files, args, common, blocks)
     _warn_langs(args, output)
     return _emit(args, root, output, head=f"✓ {len(files)} fichiers")
 
@@ -1060,17 +1092,18 @@ def _emit_split(args: argparse.Namespace, root: Path, parts, chunks) -> int:
     else:
         name = output_name(root, args)
         base = name[:-len("-dump.xml")] if name.endswith("-dump.xml") else name
-    written, sizes = [], []
+    count, method = _token_counter()
+    written = []
     for suffix, content in parts:
-        target = Path(f"{base}-part-{suffix}.xml")
+        target = Path(f"{base}-part-{suffix}-dump.xml")   # suffixe -dump.xml → pris par .gitignore
         target.write_text(content, encoding="utf-8")
-        written.append(target)
-        sizes.append(len(content))
+        written.append((target, len(content), count(content)))
+    sizes = [c for _, c, _ in written]
     summary = (f"✓ découpé en {n} partie(s) + introduction — limite {args.split} c. — "
-               f"plus grande partie {max(sizes):,} c.").replace(",", " ")
+               f"plus grande partie {max(sizes):,} c. ({method})").replace(",", " ")
     print(summary, file=sys.stderr)
-    for t in written:
-        print(f"  → {t}", file=sys.stderr)
+    for t, c, tok in written:                 # taille (caractères + tokens) après chaque ligne
+        print(f"  → {t}   {c:,} c. ~{tok:,} tok".replace(",", " "), file=sys.stderr)
     if args.clipboard:
         print("→ (presse-papier ignoré en mode --split : plusieurs fichiers)", file=sys.stderr)
     return 0

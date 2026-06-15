@@ -23,6 +23,8 @@ python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C
 python3 codetoia.py . --no-prompt       # sans le prompt d'instruction (actif par défaut)
 python3 codetoia.py . --diff            # message de suivi : SEULEMENT les modifs non commitées
 python3 codetoia.py . --diff main-feature   # message de suivi : diff entre deux réfs (sha/tag/branche)
+python3 codetoia.py . --split           # découpe en N prompts ≤ 50000 c. (suit l'arborescence)
+python3 codetoia.py . --split 80000     # même chose, limite par prompt à 80000 caractères
 python3 codetoia.py . --exclude "tests/*,output.txt"
 ```
 
@@ -35,8 +37,8 @@ usage: codetoia [-h] [-o OUTPUT] [--stdout] [-c] [--include EXT | --lang LANG]
                 [--exclude GLOB] [--diff [A-B]] [--strip-comments]
                 [--strip-blank] [--compress] [--signatures] [--callgraph]
                 [--architecture] [--setup] [--no-mask-secrets]
-                [--no-dedup-comments] [--no-prompt] [--no-tree]
-                [--max-size KB] [--keep-empty]
+                [--no-dedup-comments] [--no-prompt] [--split [CHARS]]
+                [--no-tree] [--max-size KB] [--keep-empty]
                 [path]
 
 Regroupe les sources d'un dépôt git en un bloc XML pour une IA.
@@ -81,6 +83,11 @@ options:
   --no-prompt          N'inclut pas le <prompt> d'instruction en tête (actif
                        par défaut : cadre le LLM en ingénieur, légende des
                        conventions).
+  --split [CHARS]      Découpe le dépôt en plusieurs prompts de longueur
+                       limitée (défaut: 50000 caractères), regroupés en
+                       suivant l'arborescence. Produit un message
+                       d'introduction (structure + manifeste) puis N parties
+                       numérotées : <base>-part-index.xml, -part-01.xml, …
   --no-tree            N'inclut pas l'arborescence
   --max-size KB        Ignore les fichiers > KB (défaut: 512, 0 = illimité)
   --keep-empty         Garde les fichiers vides
@@ -174,6 +181,25 @@ forme `A..B` (acceptée aussi). Le masquage de secrets s'applique au diff. Pas b
 de `--setup` (git pur). En mode `--diff`, le `<prompt>` est recadré en **message de
 suivi** : « le dépôt t'a déjà été fourni ; voici uniquement les changements » et oriente
 vers la revue (correction, effets de bord, impact, en s'appuyant sur le call_graph déjà transmis).
+
+**`--split [CHARS]`** découpe un gros dépôt en **plusieurs prompts** de longueur limitée
+(défaut **50000 caractères**), à coller **dans l'ordre, dans la même conversation** :
+
+1. un **message d'introduction** (`…-part-index.xml`) : `<prompt>` global cadrant le LLM,
+   **arborescence complète**, conventions, `common_comments`/`call_graph` partagés, et un
+   **manifeste** « partie k → tels répertoires » ; il demande au modèle d'**attendre toutes
+   les parties** avant de répondre ;
+2. puis **N parties** (`…-part-01.xml`, `-02`, …), chacune avec un court en-tête « partie
+   k/N » et ses fichiers ; la dernière annonce que le modèle peut répondre.
+
+Le découpage **suit l'arborescence** : on évalue la taille (caractères) de chaque
+sous-répertoire ; un sous-répertoire qui tient en entier reste **groupé** (et peut
+fusionner avec ses frères) ; un sous-répertoire trop gros est **scindé en ses propres
+parties**. La limite porte sur les fichiers d'une partie (le petit en-tête s'ajoute) ; un
+fichier plus gros que la limite est **isolé** dans sa partie (signalé sur stderr). Sortie :
+des fichiers `…-part-*.xml` (ou, avec `--stdout`, tout concaténé avec des séparateurs
+`===== part k =====`). Compatible avec `--signatures`/`--compress`/`--lang`… ; `--diff`,
+lui, court-circuite le découpage (il est déjà petit).
 
 Un bloc **`<prompt>`** d'instruction est **préfixé par défaut** : il cadre le modèle en
 **ingénieur logiciel**, lui annonce que des questions précises sur le code vont suivre,

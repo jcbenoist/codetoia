@@ -436,6 +436,23 @@ def git_diff(root: Path, spec: str):
     return frm, to, proc.stdout.decode("utf-8", "replace")
 
 
+def _convention_notes(opts: argparse.Namespace, intro: str) -> list[str]:
+    """Légende des conventions de format (commune au dump complet et au découpage)."""
+    notes = [intro]
+    if opts.signatures:
+        notes.append("Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie "
+                     "que seule la signature est conservée (implémentation masquée).")
+    if opts.callgraph:
+        notes.append("« call_graph » liste les appels internes au projet : « appelant -> "
+                     "appelés », puis l'index inverse « appelés <- appelants » (analyse d'impact).")
+    if opts.dedup_comments:
+        notes.append("Les marqueurs « [common-N] » dans les fichiers renvoient à la section "
+                     "« common_comments » (blocs de commentaires partagés, factorisés).")
+    if opts.mask_secrets:
+        notes.append("« [redacted] » remplace un secret masqué.")
+    return notes
+
+
 def build_prompt(opts: argparse.Namespace) -> str:
     """Bloc <prompt> XML cadrant le LLM en ingénieur logiciel + légende des conventions.
 
@@ -457,19 +474,9 @@ def build_prompt(opts: argparse.Namespace) -> str:
                         "les fichiers par leur chemin ; si une information n'y figure pas, "
                         "dis-le, n'invente rien. Attends les questions.")
     else:                                   # dump complet du dépôt
-        notes = ["Le code est dans la section « files » : une entrée par fichier, identifiée "
-                 "par son attribut path ; « directory_structure » donne l'arborescence."]
-        if opts.signatures:
-            notes.append("Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie "
-                         "que seule la signature est conservée (implémentation masquée).")
-        if opts.callgraph:
-            notes.append("« call_graph » liste les appels internes au projet : « appelant -> "
-                         "appelés », puis l'index inverse « appelés <- appelants » (analyse d'impact).")
-        if opts.dedup_comments:
-            notes.append("Les marqueurs « [common-N] » dans les fichiers renvoient à la section "
-                         "« common_comments » (blocs de commentaires partagés, factorisés).")
-        if opts.mask_secrets:
-            notes.append("« [redacted] » remplace un secret masqué.")
+        notes = _convention_notes(opts, "Le code est dans la section « files » : une entrée "
+                                  "par fichier, identifiée par son attribut path ; "
+                                  "« directory_structure » donne l'arborescence.")
         context = ("Le dépôt de code complet est fourni ci-dessous. Des questions "
                    "d'ingénieur précises sur ce code vont suivre.")
         instructions = ("Analyse le code pour pouvoir y répondre avec exactitude. Cite les "
@@ -538,6 +545,159 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
 
 
 # --------------------------------------------------------------------------- #
+# Découpage en N parties (--split) — regroupement guidé par l'arborescence
+# --------------------------------------------------------------------------- #
+
+def _file_blocks(root: Path, files: list[Path], opts: argparse.Namespace, plan: dict):
+    """Rend chaque fichier en son bloc <file>…</file> final + sa longueur (caractères)."""
+    blocks = []
+    for p in files:
+        rel = str(p.relative_to(root)).replace(os.sep, "/")
+        block = f'<file path="{rel}">\n{render_file(p, rel, opts, plan)}\n</file>'
+        blocks.append((rel, block, len(block)))
+    return blocks
+
+
+def _size_tree(blocks):
+    """Arbre de répertoires {dirs, files, size} ; size = somme du sous-arbre (caractères)."""
+    root = {"dirs": {}, "files": []}
+    for rel, block, size in blocks:
+        node = root
+        for d in rel.split("/")[:-1]:
+            node = node["dirs"].setdefault(d, {"dirs": {}, "files": []})
+        node["files"].append((rel, block, size))
+
+    def calc(node):
+        node["size"] = (sum(sz for _, _, sz in node["files"])
+                        + sum(calc(c) for c in node["dirs"].values()))
+        return node["size"]
+
+    calc(root)
+    return root
+
+
+def _subtree_files(node):
+    """Fichiers d'un sous-arbre, en ordre stable (sous-répertoires triés, puis fichiers)."""
+    out = []
+    for name in sorted(node["dirs"]):
+        out += _subtree_files(node["dirs"][name])
+    return out + node["files"]
+
+
+def _pack_tree(node, limit: int):
+    """Partitionne en parties ≤ limit en suivant l'arborescence (next-fit récursif).
+
+    Un sous-répertoire qui tient en entier reste groupé et peut fusionner avec ses
+    frères ; un sous-répertoire trop gros est découpé en ses propres parties (on isole
+    d'abord ce qui était accumulé, pour ne pas mélanger des branches éloignées).
+    """
+    chunks, cur, cur_sz = [], [], 0
+
+    def flush():
+        nonlocal cur, cur_sz
+        if cur:
+            chunks.append(cur)
+            cur, cur_sz = [], 0
+
+    for name in sorted(node["dirs"]):
+        child = node["dirs"][name]
+        if child["size"] <= limit:                  # sous-arbre entier dans une partie
+            if cur_sz + child["size"] > limit:
+                flush()
+            cur += _subtree_files(child)
+            cur_sz += child["size"]
+        else:                                       # trop gros : ses propres parties
+            flush()
+            chunks.extend(_pack_tree(child, limit))
+    for rel, block, size in node["files"]:          # fichiers du répertoire courant
+        if cur_sz + size > limit:
+            flush()
+        cur.append((rel, block, size))
+        cur_sz += size
+    flush()
+    return chunks
+
+
+def _chunk_dirs(chunk) -> list[str]:
+    """Répertoires distincts couverts par une partie (pour le manifeste / l'en-tête)."""
+    dirs = {(rel.rsplit("/", 1)[0] if "/" in rel else "(racine)") for rel, _, _ in chunk}
+    return sorted(dirs)
+
+
+def _split_index(root: Path, files: list[Path], opts: argparse.Namespace,
+                 common: list, chunks) -> str:
+    """Message d'introduction : prompt global, arborescence complète, manifeste des parties."""
+    repo = root.resolve().name
+    n = len(chunks)
+    out = []
+    if opts.prompt:
+        notes = _convention_notes(opts, "Le code arrive dans les parties suivantes (une "
+                                  "balise <file path=\"...\"> par fichier) ; "
+                                  "« directory_structure » ci-dessous donne l'arborescence complète.")
+        manifest = []
+        for i, ch in enumerate(chunks, 1):
+            size = sum(sz for _, _, sz in ch)
+            manifest.append(f"Partie {i}/{n} ({size} c., {len(ch)} fich.) — "
+                            + ", ".join(_chunk_dirs(ch)))
+        out.append(
+            "<prompt>\n"
+            "<role>Tu es un ingénieur logiciel senior.</role>\n"
+            f"<context>Le dépôt {repo} est volumineux : il est livré en {n} parties "
+            "numérotées qui suivent ce message d'introduction. Chaque partie regroupe les "
+            "fichiers de certains répertoires. Des questions d'ingénieur sur l'ensemble du "
+            "projet suivront.</context>\n"
+            "<format_notes>" + " ".join(notes) + "</format_notes>\n"
+            "<manifest>\n" + "\n".join(manifest) + "\n</manifest>\n"
+            f"<instructions>N'analyse pas encore : attends d'avoir reçu les {n} parties "
+            f"(chacune marquée « partie k/{n} »). Mémorise dès maintenant l'arborescence et "
+            "les conventions ci-dessous. Quand tout est reçu, traite le projet comme un tout ; "
+            "cite les fichiers par leur chemin et, si une information n'y figure pas, dis-le, "
+            "n'invente rien.</instructions>\n"
+            "</prompt>")
+    out += ["<file_summary>",
+            f"Projet {repo} — {len(files)} fichiers, découpé en {n} parties. Ce message est "
+            "l'introduction (arborescence + conventions) ; les fichiers suivent par parties.",
+            "</file_summary>"]
+    if not opts.no_tree:
+        out += ["<directory_structure>", render_tree(root, files), "</directory_structure>"]
+    if common:
+        out += ["<common_comments>",
+                "# Blocs de commentaires partagés ; les parties y réfèrent par [common-N].",
+                render_common(common), "</common_comments>"]
+    if opts.callgraph:
+        for name, graph in langs.build_callgraph(files, root) or []:
+            out += [f'<call_graph lang="{name}">', graph, "</call_graph>"]
+    return "\n".join(out) + "\n"
+
+
+def _split_chunk(repo: str, opts: argparse.Namespace, i: int, n: int, chunk) -> str:
+    """Une partie : court en-tête + ses fichiers. Le contexte global est dans l'introduction."""
+    out = []
+    if opts.prompt:
+        last = (" C'est la dernière partie : tu peux maintenant répondre aux questions."
+                if i == n else "")
+        out.append(f'<prompt>Partie {i}/{n} du dépôt {repo} — fichiers des répertoires : '
+                   f'{", ".join(_chunk_dirs(chunk))}. Le contexte global (arborescence, '
+                   f'conventions) a été fourni dans le message d\'introduction.{last}</prompt>')
+    out.append(f'<files part="{i}/{n}">')
+    out += [block for _, block, _ in chunk]
+    out.append("</files>")
+    return "\n".join(out) + "\n"
+
+
+def build_split(root: Path, files: list[Path], opts: argparse.Namespace,
+                common: list, plan: dict, limit: int):
+    """(parties, chunks). parties = [(suffixe, contenu)] : introduction puis N parties."""
+    chunks = _pack_tree(_size_tree(_file_blocks(root, files, opts, plan)), limit)
+    repo = root.resolve().name
+    n = len(chunks)
+    parts = [("index", _split_index(root, files, opts, common, chunks))]
+    for i, ch in enumerate(chunks, 1):
+        parts.append((f"{i:02d}", _split_chunk(repo, opts, i, n, ch)))
+    return parts, chunks
+
+
+# --------------------------------------------------------------------------- #
 # Estimation de tokens & presse-papier
 # --------------------------------------------------------------------------- #
 
@@ -591,6 +751,8 @@ def output_name(root: Path, args: argparse.Namespace) -> str:
         parts.append(args.lang)
     elif args.include:
         parts.append("inc-" + ",".join(args.include))
+    if args.split is not None:
+        parts.append("split")
     if not args.mask_secrets:
         parts.append("nomask")
     if not args.dedup_comments:
@@ -721,6 +883,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-prompt", dest="prompt", action="store_false",
                     help="N'inclut pas le <prompt> d'instruction en tête (actif par "
                          "défaut : cadre le LLM en ingénieur, légende des conventions).")
+    ap.add_argument("--split", nargs="?", type=int, const=50000, default=None, metavar="CHARS",
+                    help="Découpe le dépôt en plusieurs prompts de longueur limitée "
+                         "(défaut: 50000 caractères), regroupés en suivant l'arborescence. "
+                         "Produit un message d'introduction (structure + manifeste) puis N "
+                         "parties numérotées : <base>-part-index.xml, -part-01.xml, …")
     ap.add_argument("--no-tree", action="store_true", help="N'inclut pas l'arborescence")
     ap.add_argument("--max-size", type=int, default=512, metavar="KB",
                     help="Ignore les fichiers > KB (défaut: 512, 0 = illimité)")
@@ -783,6 +950,9 @@ def main(argv: list[str] | None = None) -> int:
         args.include = ([e.strip() for e in args.include.split(",")]
                         if args.include else None)
     args.exclude = [e.strip() for e in args.exclude.split(",") if e.strip()]
+    if args.split is not None and args.split <= 0:
+        print("Erreur: --split attend un nombre de caractères positif.", file=sys.stderr)
+        return 2
 
     root = Path(args.path)
     if not root.is_dir():
@@ -818,25 +988,40 @@ def main(argv: list[str] | None = None) -> int:
     if common:
         print(f"🧩 {len(common)} bloc(s) de commentaires factorisé(s) dans "
               "<common_comments>", file=sys.stderr)
+
+    if args.split is not None:                 # découpage en N prompts
+        parts, chunks = build_split(root, files, args, common, plan, args.split)
+        _warn_langs(args, "".join(c for _, c in parts))
+        return _emit_split(args, root, parts, chunks)
+
     output = build_xml(root, files, args, common, plan)
-    if (args.signatures or args.callgraph) and langs.MISSING:
-        miss = ", ".join(sorted(langs.MISSING))
-        print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "
-              f"Active-le une fois avec : python {Path(__file__).name} --setup",
-              file=sys.stderr)
-    elif args.callgraph and "<call_graph" not in output:
-        print(f"ℹ callgraph : généré uniquement pour {', '.join(langs.CALLGRAPH_NAMES)} "
-              "(aucun fichier concerné ici).", file=sys.stderr)
+    _warn_langs(args, output)
     return _emit(args, root, output, head=f"✓ {len(files)} fichiers")
 
 
-def _emit(args: argparse.Namespace, root: Path, output: str, head: str) -> int:
-    """Récap secrets + estimation de tokens + écriture (fichier/stdout/presse-papier)."""
+def _secret_recap(args: argparse.Namespace) -> None:
     if args.mask_secrets and _SECRET_HITS:
         kinds = ", ".join(sorted({k for _, k in _SECRET_HITS}))
         nfiles = len({f for f, _ in _SECRET_HITS})
         print(f"🔒 {len(_SECRET_HITS)} secret(s) masqué(s) dans {nfiles} fichier(s) "
               f"[{kinds}]", file=sys.stderr)
+
+
+def _warn_langs(args: argparse.Namespace, full_text: str) -> None:
+    """Avertissements tree-sitter / callgraph (communs au dump complet et au découpage)."""
+    if (args.signatures or args.callgraph) and langs.MISSING:
+        miss = ", ".join(sorted(langs.MISSING))
+        print(f"⚠ Tree-sitter indisponible pour {miss} (contenu intégral / pas de graphe). "
+              f"Active-le une fois avec : python {Path(__file__).name} --setup",
+              file=sys.stderr)
+    elif args.callgraph and "<call_graph" not in full_text:
+        print(f"ℹ callgraph : généré uniquement pour {', '.join(langs.CALLGRAPH_NAMES)} "
+              "(aucun fichier concerné ici).", file=sys.stderr)
+
+
+def _emit(args: argparse.Namespace, root: Path, output: str, head: str) -> int:
+    """Récap secrets + estimation de tokens + écriture (fichier/stdout/presse-papier)."""
+    _secret_recap(args)
     tokens, method = estimate_tokens(output)
 
     if args.stdout:
@@ -852,6 +1037,42 @@ def _emit(args: argparse.Namespace, root: Path, output: str, head: str) -> int:
     print(f"{summary}\n→ écrit dans {target}", file=sys.stderr)
     if args.clipboard and to_clipboard(output):
         print("→ copié aussi dans le presse-papier", file=sys.stderr)
+    return 0
+
+
+def _emit_split(args: argparse.Namespace, root: Path, parts, chunks) -> int:
+    """Écrit les parties du découpage (un fichier chacune) ou les concatène sur stdout."""
+    _secret_recap(args)
+    n = len(chunks)
+    big = sorted({rel for ch in chunks for rel, _, sz in ch if sz > args.split})
+    if big:
+        shown = ", ".join(big[:3]) + ("…" if len(big) > 3 else "")
+        print(f"⚠ {len(big)} fichier(s) dépassent à eux seuls {args.split} c. "
+              f"(isolés dans leur partie) : {shown}", file=sys.stderr)
+
+    if args.stdout:
+        for suffix, content in parts:
+            sys.stdout.write(f"\n===== part {suffix} =====\n{content}")
+        return 0
+
+    if args.output:
+        base = str(Path(args.output).with_suffix(""))
+    else:
+        name = output_name(root, args)
+        base = name[:-len("-dump.xml")] if name.endswith("-dump.xml") else name
+    written, sizes = [], []
+    for suffix, content in parts:
+        target = Path(f"{base}-part-{suffix}.xml")
+        target.write_text(content, encoding="utf-8")
+        written.append(target)
+        sizes.append(len(content))
+    summary = (f"✓ découpé en {n} partie(s) + introduction — limite {args.split} c. — "
+               f"plus grande partie {max(sizes):,} c.").replace(",", " ")
+    print(summary, file=sys.stderr)
+    for t in written:
+        print(f"  → {t}", file=sys.stderr)
+    if args.clipboard:
+        print("→ (presse-papier ignoré en mode --split : plusieurs fichiers)", file=sys.stderr)
     return 0
 
 

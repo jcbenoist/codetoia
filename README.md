@@ -106,6 +106,7 @@ python3 codetoia.py . --architecture --full-code  # ⚙ idem + code intégral (s
 python3 codetoia.py --setup            # installe les libs des options ⚙ (1 fois/machine)
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C/C++/JS/TS/RF
+python3 codetoia.py . --lang go --include md,yaml   # cumulables : Go + Markdown + YAML
 python3 codetoia.py . --no-prompt       # sans le prompt d'instruction (actif par défaut)
 python3 codetoia.py . --diff            # message de suivi : SEULEMENT les modifs non commitées
 python3 codetoia.py . --diff main-feature   # message de suivi : diff entre deux réfs (sha/tag/branche)
@@ -119,7 +120,7 @@ source de vérité). Régénère-le après toute modif de la CLI : `python3 code
 
 <!-- BEGIN: codetoia --help (généré par `codetoia --readme`, ne pas éditer) -->
 ```text
-usage: codetoia [-h] [-o OUTPUT] [--stdout] [-c] [--include EXT | --lang LANG]
+usage: codetoia [-h] [-o OUTPUT] [--stdout] [-c] [--include EXT] [--lang LANG]
                 [--exclude GLOB] [--diff [A-B]] [--strip-comments]
                 [--strip-blank] [--compress] [--signatures] [--callgraph]
                 [--architecture] [--full-code] [--setup] [--no-mask-secrets]
@@ -141,7 +142,8 @@ options:
   --include EXT        Extensions à inclure (ex: py,ts,md)
   --lang LANG          N'inclure que les fichiers d'un/des langage(s).
                        Abréviations : Go, CS, C, C++, JS, TS, RF (ex: go,cs).
-                       Exclusif avec --include.
+                       Combinable avec --include : union des deux (ex: --lang
+                       go --include md,yaml).
   --exclude GLOB       Motifs glob à exclure, séparés par des virgules
   --diff [A-B]         Message de suivi ne contenant QUE le diff (à coller
                        après le dump complet, dans la même conversation). Sans

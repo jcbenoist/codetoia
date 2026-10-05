@@ -806,8 +806,8 @@ def output_name(root: Path, args: argparse.Namespace) -> str:
             parts.append("noblank")
     if args.lang:
         parts.append(args.lang)
-    elif args.include:
-        parts.append("inc-" + ",".join(args.include))
+    if args.include_exts:
+        parts.append("inc-" + ",".join(args.include_exts))
     if args.split is not None:
         parts.append("split")
     if not args.mask_secrets:
@@ -850,7 +850,16 @@ def _maybe_reexec(args_list: list[str]) -> None:
         same = False
     if py.exists() and not same:
         os.environ["CODETOIA_REEXEC"] = "1"
-        os.execv(str(py), [str(py), str(Path(__file__).resolve()), *args_list])
+        cmd = [str(py), str(Path(__file__).resolve()), *args_list]
+        if os.name == "nt":
+            # Windows : os.execv n'y remplace pas le process (il en lance un nouveau et
+            # le parent quitte → la console rend la main avant la fin). On attend donc
+            # l'enfant et on propage son code retour.
+            try:
+                raise SystemExit(subprocess.call(cmd))
+            except KeyboardInterrupt:
+                raise SystemExit(130)
+        os.execv(str(py), cmd)
 
 
 def do_setup() -> int:
@@ -900,12 +909,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--stdout", action="store_true", help="Écrit le dump sur stdout")
     ap.add_argument("-c", "--clipboard", action="store_true",
                     help="Copie aussi vers le presse-papier (en plus du fichier)")
-    sel = ap.add_mutually_exclusive_group()
-    sel.add_argument("--include", metavar="EXT", help="Extensions à inclure (ex: py,ts,md)")
-    sel.add_argument("--lang", metavar="LANG",
-                     help="N'inclure que les fichiers d'un/des langage(s). "
-                          "Abréviations : Go, CS, C, C++, JS, TS, RF (ex: go,cs). "
-                          "Exclusif avec --include.")
+    ap.add_argument("--include", metavar="EXT", help="Extensions à inclure (ex: py,ts,md)")
+    ap.add_argument("--lang", metavar="LANG",
+                    help="N'inclure que les fichiers d'un/des langage(s). "
+                         "Abréviations : Go, CS, C, C++, JS, TS, RF (ex: go,cs). "
+                         "Combinable avec --include : union des deux (ex: --lang go "
+                         "--include md,yaml).")
     ap.add_argument("--exclude", metavar="GLOB", default="",
                     help="Motifs glob à exclure, séparés par des virgules")
     ap.add_argument("--diff", nargs="?", const="", default=None, metavar="A-B",
@@ -1004,17 +1013,19 @@ def main(argv: list[str] | None = None) -> int:
               "(le code est déjà intégral).", file=sys.stderr)
     if args.compress:
         args.strip_comments = args.strip_blank = True
-    if args.lang:  # exclusif de --include (garanti par argparse)
-        exts, unknown = langs.resolve_filter(args.lang)
+    # --include et --lang se cumulent : union des extensions demandées.
+    args.include_exts = ([e.strip() for e in args.include.split(",") if e.strip()]
+                         if args.include else [])
+    exts = list(args.include_exts)
+    if args.lang:
+        lang_exts, unknown = langs.resolve_filter(args.lang)
         if unknown:
             print(f"Erreur: langage(s) inconnu(s) : {', '.join(unknown)}.\n"
                   f"Abréviations valides : {', '.join(langs.FILTER_NAMES)}.",
                   file=sys.stderr)
             return 2
-        args.include = exts
-    else:
-        args.include = ([e.strip() for e in args.include.split(",")]
-                        if args.include else None)
+        exts += lang_exts
+    args.include = exts or None
     args.exclude = [e.strip() for e in args.exclude.split(",") if e.strip()]
     if args.split is not None and args.split <= 0:
         print("Erreur: --split attend un nombre de caractères positif.", file=sys.stderr)

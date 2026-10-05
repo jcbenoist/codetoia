@@ -366,7 +366,12 @@ def render_tree(root: Path, files: list[Path]) -> str:
     return "\n".join(lines)
 
 
-def render_file(p: Path, rel: str, opts: argparse.Namespace, plan: dict) -> str:
+def render_file(p: Path, rel: str, opts: argparse.Namespace, plan: dict,
+                sig: bool | None = None) -> str | None:
+    """Contenu rendu d'un fichier. `sig` force (True) ou interdit (False) les signatures ;
+    None = selon les options. Avec sig=True, None si le langage n'est pas géré."""
+    if sig is None:
+        sig = opts.signatures and not opts.full_code
     try:
         source = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
@@ -377,10 +382,12 @@ def render_file(p: Path, rel: str, opts: argparse.Namespace, plan: dict) -> str:
         source = factor_comments(source, pl)  # commentaires redondants → [common-N]
     if opts.mask_secrets:
         source = mask_secrets(source, rel)  # avant tout traitement
-    if opts.signatures:
-        sig = langs.signatures(source, ext)
-        if sig is not None:
-            source = sig  # sinon : repli silencieux sur le contenu intégral
+    if sig:
+        out = langs.signatures(source, ext)
+        if out is not None:
+            source = out  # sinon : repli silencieux sur le contenu intégral
+        elif opts.full_code:
+            return None   # section <signatures> : rien de plus que le code intégral
     return transform(source, ext, opts)
 
 
@@ -439,7 +446,11 @@ def git_diff(root: Path, spec: str):
 def _convention_notes(opts: argparse.Namespace, intro: str) -> list[str]:
     """Légende des conventions de format (commune au dump complet et au découpage)."""
     notes = [intro]
-    if opts.signatures:
+    if opts.signatures and opts.full_code:
+        notes.append("« signatures » donne une vue d'ensemble (signatures seules, corps "
+                     "remplacés par « { ... } ») ; le code intégral de chaque fichier est "
+                     "dans « files ».")
+    elif opts.signatures:
         notes.append("Un corps remplacé par « { ... } » (étapes Robot par « ... ») signifie "
                      "que seule la signature est conservée (implémentation masquée).")
     if opts.callgraph:
@@ -510,7 +521,7 @@ def build_diff_xml(opts: argparse.Namespace, diff) -> str:
 
 
 def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
-              common: list, blocks) -> str:
+              common: list, plan: dict, blocks) -> str:
     """Sortie XML : balises explicites pour maximiser l'attention du LLM.
 
     `blocks` = fichiers déjà rendus (voir _file_blocks), réutilisés tels quels.
@@ -534,6 +545,7 @@ def build_xml(root: Path, files: list[Path], opts: argparse.Namespace,
         out += ["<common_comments>",
                 "# Blocs de commentaires partagés ; les fichiers y réfèrent par [common-N].",
                 render_common(common), "</common_comments>"]
+    out += _signatures_section(root, files, opts, plan)
     out.append("<files>")
     out += [block for _, block, _ in blocks]
     out.append("</files>")
@@ -555,6 +567,20 @@ def _file_blocks(root: Path, files: list[Path], opts: argparse.Namespace, plan: 
         block = f'<file path="{rel}">\n{render_file(p, rel, opts, plan)}\n</file>'
         blocks.append((rel, block, len(block)))
     return blocks
+
+
+def _signatures_section(root: Path, files: list[Path], opts: argparse.Namespace,
+                        plan: dict) -> list[str]:
+    """--full-code + --signatures : section <signatures> (vue d'ensemble) en plus du code."""
+    if not (opts.full_code and opts.signatures):
+        return []
+    out = []
+    for p in files:
+        rel = str(p.relative_to(root)).replace(os.sep, "/")
+        sig = render_file(p, rel, opts, plan, sig=True)
+        if sig is not None:
+            out.append(f'<file path="{rel}">\n{sig}\n</file>')
+    return ["<signatures>", *out, "</signatures>"] if out else []
 
 
 def _size_tree(blocks):
@@ -643,7 +669,7 @@ def _chunk_slug(chunk) -> str:
 
 
 def _split_index(root: Path, files: list[Path], opts: argparse.Namespace,
-                 common: list, chunks) -> str:
+                 common: list, plan: dict, chunks) -> str:
     """Message d'introduction : prompt global, arborescence complète, manifeste des parties."""
     repo = root.resolve().name
     n = len(chunks)
@@ -682,6 +708,7 @@ def _split_index(root: Path, files: list[Path], opts: argparse.Namespace,
         out += ["<common_comments>",
                 "# Blocs de commentaires partagés ; les parties y réfèrent par [common-N].",
                 render_common(common), "</common_comments>"]
+    out += _signatures_section(root, files, opts, plan)
     if opts.callgraph:
         for name, graph in langs.build_callgraph(files, root) or []:
             out += [f'<call_graph lang="{name}">', graph, "</call_graph>"]
@@ -704,12 +731,12 @@ def _split_chunk(repo: str, opts: argparse.Namespace, i: int, n: int, chunk) -> 
 
 
 def build_split(root: Path, files: list[Path], opts: argparse.Namespace,
-                common: list, blocks, limit: int):
+                common: list, plan: dict, blocks, limit: int):
     """(parties, chunks). parties = [(suffixe, contenu)] : introduction puis N parties."""
     chunks = _pack_tree(_size_tree(blocks), limit)
     repo = root.resolve().name
     n = len(chunks)
-    parts = [("00-index", _split_index(root, files, opts, common, chunks))]
+    parts = [("00-index", _split_index(root, files, opts, common, plan, chunks))]
     for i, ch in enumerate(chunks, 1):
         parts.append((f"{i:02d}-{_chunk_slug(ch)}", _split_chunk(repo, opts, i, n, ch)))
     return parts, chunks
@@ -768,6 +795,8 @@ def output_name(root: Path, args: argparse.Namespace) -> str:
             parts.append("signatures")
         if args.callgraph:
             parts.append("callgraph")
+    if args.full_code and args.signatures:
+        parts.append("fullcode")
     if args.compress:
         parts.append("compress")
     else:
@@ -898,6 +927,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "inversé (Go, C#, C, C++, JS, TS, Robot).")
     ap.add_argument("--architecture", action="store_true",
                     help="Raccourci: --signatures + --callgraph.")
+    ap.add_argument("--full-code", action="store_true",
+                    help="Avec --signatures/--architecture : garde le code intégral dans "
+                         "<files> et ajoute les signatures en vue d'ensemble dans une "
+                         "section <signatures> (plus de tokens, mais rien n'est masqué).")
     ap.add_argument("--setup", action="store_true",
                     help="Installe (une fois, internet requis) tree-sitter & tiktoken "
                          "dans un .venv local pour activer --signatures/--callgraph. "
@@ -966,6 +999,9 @@ def main(argv: list[str] | None = None) -> int:
         return do_setup()
     if args.architecture:  # raccourci = signatures + graphe d'appel
         args.signatures = args.callgraph = True
+    if args.full_code and not args.signatures:
+        print("ℹ --full-code : sans effet sans --signatures/--architecture "
+              "(le code est déjà intégral).", file=sys.stderr)
     if args.compress:
         args.strip_comments = args.strip_blank = True
     if args.lang:  # exclusif de --include (garanti par argparse)
@@ -1022,11 +1058,11 @@ def main(argv: list[str] | None = None) -> int:
     blocks = _file_blocks(root, files, args, plan)   # rendu unique, réutilisé partout
 
     if args.split is not None:                 # découpage en N prompts
-        parts, chunks = build_split(root, files, args, common, blocks, args.split)
+        parts, chunks = build_split(root, files, args, common, plan, blocks, args.split)
         _warn_langs(args, "".join(c for _, c in parts))
         return _emit_split(args, root, parts, chunks)
 
-    output = build_xml(root, files, args, common, blocks)
+    output = build_xml(root, files, args, common, plan, blocks)
     _warn_langs(args, output)
     return _emit(args, root, output, head=f"✓ {len(files)} fichiers")
 

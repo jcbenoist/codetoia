@@ -4,6 +4,91 @@ Regroupe les sources d'un **dépôt git** en **un seul bloc XML compact**,
 copiable/collable dans un chat IA (ChatGPT, Claude…). Objectif : minimum de tokens,
 contenu intégral, prompt précis indiquant au LLM d'agir comme ingénieur logiciel.
 
+## Installation sur une machine neuve
+
+### 1. Prérequis
+
+| Outil | Rôle | Obligatoire ? |
+|---|---|---|
+| **git** | sélection des fichiers (`git ls-files`), `--diff` | oui |
+| **Python 3** (3.9+ conseillé) avec `venv` + `ensurepip` | exécution du script ; `venv` seulement pour `--setup` | oui |
+| outil presse-papier (`wl-copy`, `xclip`, `pbcopy`, `clip.exe`) | option `-c` | non |
+| accès internet | uniquement pour `--setup` (une fois) | non |
+
+Installation des prérequis selon le système :
+
+```bash
+# Fedora / RHEL
+sudo dnf install git python3 wl-clipboard        # ou xclip sous X11
+
+# Debian / Ubuntu (python3-venv est séparé sur ces distributions)
+sudo apt install git python3 python3-venv wl-clipboard   # ou xclip sous X11
+
+# macOS (git via les Command Line Tools ; pbcopy est fourni par le système)
+xcode-select --install
+brew install python                              # si Python 3 absent
+
+# Windows (PowerShell ; clip.exe est fourni par le système)
+winget install Git.Git Python.Python.3.12
+```
+
+Vérification : `git --version` et `python3 --version` (sous Windows : `python --version`).
+
+### 2. Récupérer l'outil
+
+Aucun paquet pip à installer : le cœur tourne en **Python standard**. Il suffit de
+cloner le dépôt (n'importe où, ex. `~/outils`) :
+
+```bash
+git clone https://github.com/jcbenoist/codetoia.git ~/outils/codetoia
+# ou en SSH si ta clé est configurée : git@github.com:jcbenoist/codetoia.git
+```
+
+Sans git sur cette machine : copier `codetoia.py` **et** le dossier `codetoia_langs/`
+côte à côte (les deux sont nécessaires).
+
+### 3. (Optionnel) Activer les options ⚙
+
+Pour `--signatures`, `--callgraph`, `--architecture` et le comptage exact des tokens,
+une seule fois par machine (internet requis) :
+
+```bash
+python3 ~/outils/codetoia/codetoia.py --setup
+```
+
+Crée un `.venv` dans le dossier de l'outil ; le script s'en sert ensuite tout seul
+(détails : [Modes signatures / callgraph : installation](#modes-signatures--callgraph--installation)).
+
+### 4. (Optionnel) Raccourci `codetoia`
+
+Pour taper `codetoia` depuis n'importe quel dépôt :
+
+```bash
+# Linux / macOS — ajouter à ~/.bashrc (ou ~/.zshrc), puis ouvrir un nouveau terminal
+alias codetoia='python3 ~/outils/codetoia/codetoia.py'
+```
+
+```powershell
+# Windows — ajouter à $PROFILE (notepad $PROFILE), puis rouvrir PowerShell
+function codetoia { python "$HOME\outils\codetoia\codetoia.py" @args }
+```
+
+### 5. Vérifier
+
+```bash
+codetoia --help                      # affiche les options
+cd /chemin/vers/un/depot && codetoia .   # → <repo>-dump.xml dans le dossier courant
+```
+
+### Mise à jour / désinstallation
+
+```bash
+git -C ~/outils/codetoia pull                  # mise à jour
+python3 ~/outils/codetoia/codetoia.py --setup  # à relancer si un langage a été ajouté
+```
+
+Désinstaller : supprimer le dossier de l'outil (le `.venv` est dedans) et l'alias.
+
 ## Utilisation
 
 Quelques exemples (le répertoire doit être un dépôt git) :
@@ -17,6 +102,7 @@ python3 codetoia.py . --compress       # gain max : retire commentaires + lignes
 python3 codetoia.py . --signatures     # ⚙ signatures seules (Go/CS/C/C++/JS/TS/RF)
 python3 codetoia.py . --callgraph      # ⚙ ajoute le graphe d'appel (Go, C#, C, C++, JS, TS, Robot)
 python3 codetoia.py . --architecture   # ⚙ = --signatures + --callgraph
+python3 codetoia.py . --architecture --full-code  # ⚙ idem + code intégral (signatures en vue d'ensemble)
 python3 codetoia.py --setup            # installe les libs des options ⚙ (1 fois/machine)
 python3 codetoia.py . --include py,ts   # uniquement certaines extensions
 python3 codetoia.py . --lang go,cs      # uniquement un/des langage(s) : Go/CS/C/C++/JS/TS/RF
@@ -36,7 +122,7 @@ source de vérité). Régénère-le après toute modif de la CLI : `python3 code
 usage: codetoia [-h] [-o OUTPUT] [--stdout] [-c] [--include EXT | --lang LANG]
                 [--exclude GLOB] [--diff [A-B]] [--strip-comments]
                 [--strip-blank] [--compress] [--signatures] [--callgraph]
-                [--architecture] [--setup] [--no-mask-secrets]
+                [--architecture] [--full-code] [--setup] [--no-mask-secrets]
                 [--no-dedup-comments] [--no-prompt] [--split [CHARS]]
                 [--no-tree] [--max-size KB] [--keep-empty]
                 [path]
@@ -71,6 +157,10 @@ options:
   --callgraph          Ajoute une section <call_graph> appelant→appelés +
                        index inversé (Go, C#, C, C++, JS, TS, Robot).
   --architecture       Raccourci: --signatures + --callgraph.
+  --full-code          Avec --signatures/--architecture : garde le code
+                       intégral dans <files> et ajoute les signatures en vue
+                       d'ensemble dans une section <signatures> (plus de
+                       tokens, mais rien n'est masqué).
   --setup              Installe (une fois, internet requis) tree-sitter &
                        tiktoken dans un .venv local pour activer
                        --signatures/--callgraph. Ensuite le script s'en sert
